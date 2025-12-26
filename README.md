@@ -4,7 +4,7 @@ An Android **SendSpin** client that acts as a synchronized network audio **playe
 It connects to a SendSpin-compatible server over WebSocket, receives timestamped PCM or Opus audio frames,
 performs clock synchronisation and jitter buffering, and plays audio in tight sync with other devices.
 
-![UI Screenshot](ui.png)
+<img src="ui.png" alt="UI Screenshot" width="50%">
 
 ## Features
 
