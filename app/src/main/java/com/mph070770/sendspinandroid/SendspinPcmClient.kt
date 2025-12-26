@@ -40,6 +40,8 @@ class SendspinPcmClient(
     private var channels: Int = 2
     private var bitDepth: Int = 16
 
+    private var opusDecoder: OpusDecoder? = null
+
     private var playAtServerUs: Long = Long.MIN_VALUE
 
     // Realtime playout offset (µs). Negative means "play earlier" (speed up/catch up).
@@ -96,6 +98,7 @@ class SendspinPcmClient(
 
         output.stop()
         jitter.clear()
+        opusDecoder = null
         playAtServerUs = Long.MIN_VALUE
 
         onUiUpdate {
@@ -119,6 +122,10 @@ class SendspinPcmClient(
 
     private fun buildPlayerSupportObject(): JSONObject {
         val supportedFormats = JSONArray()
+            // Prefer Opus for bandwidth efficiency
+            .put(JSONObject().put("codec", "opus").put("channels", 2).put("sample_rate", 48000).put("bit_depth", 16))
+            .put(JSONObject().put("codec", "opus").put("channels", 2).put("sample_rate", 44100).put("bit_depth", 16))
+            // Fallback to PCM
             .put(JSONObject().put("codec", "pcm").put("channels", 2).put("sample_rate", 48000).put("bit_depth", 16))
             .put(JSONObject().put("codec", "pcm").put("channels", 2).put("sample_rate", 44100).put("bit_depth", 16))
 
@@ -139,7 +146,7 @@ class SendspinPcmClient(
 
         val playerSupport = buildPlayerSupportObject()
         hello.put("player@v1_support", playerSupport)
-        hello.put("player_support", playerSupport)
+        hello.put("player_support", playerSupport)  // Legacy field for compatibility
 
         sendJson("client/hello", hello)
         onUiUpdate { it.copy(status = "sent client/hello") }
@@ -178,7 +185,7 @@ class SendspinPcmClient(
                     tag,
                     "stats: offset=${clock.estimatedOffsetUs()}us drift=${String.format("%.3f", clock.estimatedDriftPpm())}ppm " +
                             "rtt~=${clock.estimatedRttUs()}us queued=${snapshot.queuedChunks} ahead~=${snapshot.bufferAheadMs}ms " +
-                            "playoutOffset=${playoutOffsetUs / 1000}ms"
+                            "codec=$codec playoutOffset=${playoutOffsetUs / 1000}ms"
                 )
                 delay(3000L)
             }
@@ -220,7 +227,7 @@ class SendspinPcmClient(
                 }
 
                 if (!output.isStarted()) {
-                    if (codec != "pcm") {
+                    if (codec != "pcm" && codec != "opus") {
                         delay(50)
                         continue
                     }
@@ -241,8 +248,21 @@ class SendspinPcmClient(
 
                     if (canStart) {
                         output.start(sampleRate, channels, bitDepth)
+
+                        // Initialize Opus decoder if needed
+                        if (codec == "opus") {
+                            opusDecoder = try {
+                                OpusDecoder(sampleRate, channels)
+                            } catch (e: Exception) {
+                                Log.e(tag, "Failed to create Opus decoder", e)
+                                sendClientStateError()
+                                delay(100)
+                                continue
+                            }
+                        }
+
                         sendClientStateSynchronized()
-                        Log.i(tag, "Audio output started sr=$sampleRate ch=$channels bd=$bitDepth")
+                        Log.i(tag, "Audio output started sr=$sampleRate ch=$channels bd=$bitDepth codec=$codec")
                     } else {
                         delay(10)
                         continue
@@ -259,6 +279,18 @@ class SendspinPcmClient(
                     continue
                 }
 
+                // Decode if Opus
+                val pcmData = if (codec == "opus") {
+                    opusDecoder?.decode(chunk.pcmData) ?: ByteArray(0)
+                } else {
+                    chunk.pcmData
+                }
+
+                if (pcmData.isEmpty()) {
+                    Log.w(tag, "Empty PCM data after decode")
+                    continue
+                }
+
                 val effectiveServerTsUs =
                     if (playAtServerUs != Long.MIN_VALUE) maxOf(chunk.serverTimestampUs, playAtServerUs)
                     else chunk.serverTimestampUs
@@ -272,11 +304,19 @@ class SendspinPcmClient(
                     var dropped = 1
                     while (true) {
                         val next = jitter.pollPlayable(nowUs(), offUs, Long.MAX_VALUE) ?: break
+                        val nextPcm = if (codec == "opus") {
+                            opusDecoder?.decode(next.pcmData) ?: ByteArray(0)
+                        } else {
+                            next.pcmData
+                        }
+
                         val nextLocalPlayUs = (next.serverTimestampUs - offUs) + playoutOffsetUs
                         val nextEarlyUs = nextLocalPlayUs - nowUs()
                         dropped++
                         if (nextEarlyUs >= -targetLateUs) {
-                            output.writePcm(next.pcmData)
+                            if (nextPcm.isNotEmpty()) {
+                                output.writePcm(nextPcm)
+                            }
                             break
                         }
                     }
@@ -288,7 +328,7 @@ class SendspinPcmClient(
                     delay((earlyUs / 1000).coerceAtMost(maxEarlySleepMs))
                 }
 
-                output.writePcm(chunk.pcmData)
+                output.writePcm(pcmData)
             }
         }
     }
@@ -341,14 +381,19 @@ class SendspinPcmClient(
 
                         output.stop()
                         jitter.clear()
+                        opusDecoder = null
                     }
                 }
 
-                "stream/clear" -> jitter.clear()
+                "stream/clear" -> {
+                    jitter.clear()
+                    opusDecoder?.reset()
+                }
 
                 "stream/end" -> {
                     output.stop()
                     jitter.clear()
+                    opusDecoder = null
                     playAtServerUs = Long.MIN_VALUE
                     onUiUpdate { it.copy(status = "stream/end", streamDesc = "") }
                 }
@@ -370,13 +415,13 @@ class SendspinPcmClient(
 
         val type = data[0].toInt() and 0xFF
         if (type != 4) return
-        if (codec != "pcm") return
+        if (codec != "pcm" && codec != "opus") return
         if (data.size < 1 + 8 + 1) return
 
         val tsServerUs = readInt64BE(data, 1)
-        val pcm = data.copyOfRange(1 + 8, data.size)
+        val encodedData = data.copyOfRange(1 + 8, data.size)
 
-        jitter.offer(tsServerUs, pcm, clock.estimatedOffsetUs(), nowUs())
+        jitter.offer(tsServerUs, encodedData, clock.estimatedOffsetUs(), nowUs())
     }
 
     private fun readInt64BE(buf: ByteArray, off: Int): Long {

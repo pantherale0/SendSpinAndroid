@@ -1,7 +1,6 @@
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-    // ✅ Required for Compose with Kotlin 2.x
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
@@ -39,8 +38,6 @@ android {
         compose = true
     }
 
-    // ❌ REMOVE composeOptions.kotlinCompilerExtensionVersion for Kotlin 2.x
-    // composeOptions { kotlinCompilerExtensionVersion = "..." }
 }
 
 dependencies {
@@ -55,4 +52,5 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.json:json:20240303")
+    implementation("io.github.jaredmdobson:concentus:1.0.2")
 }
