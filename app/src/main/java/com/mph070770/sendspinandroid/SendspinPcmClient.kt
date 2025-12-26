@@ -142,7 +142,7 @@ class SendspinPcmClient(
             .put("client_id", clientId)
             .put("name", clientName)
             .put("version", 1)
-            .put("supported_roles", JSONArray().put("player@v1"))
+            .put("supported_roles", JSONArray().put("player@v1").put("controller@v1"))
 
         val playerSupport = buildPlayerSupportObject()
         hello.put("player@v1_support", playerSupport)
@@ -150,6 +150,31 @@ class SendspinPcmClient(
 
         sendJson("client/hello", hello)
         onUiUpdate { it.copy(status = "sent client/hello") }
+    }
+
+    fun sendControllerCommand(command: String, volume: Int? = null, mute: Boolean? = null) {
+        val controller = JSONObject().put("command", command)
+        volume?.let { controller.put("volume", it) }
+        mute?.let { controller.put("mute", it) }
+        sendJson("client/command", JSONObject().put("controller", controller))
+    }
+
+    fun setPlayerVolume(volume: Int) {
+        val clamped = volume.coerceIn(0, 100)
+        Log.i(tag, "setPlayerVolume: $clamped (local control)")
+        sendClientStatePlayer(volume = clamped, muted = null)
+    }
+
+    fun setPlayerMute(muted: Boolean) {
+        Log.i(tag, "setPlayerMute: $muted (local control)")
+        sendClientStatePlayer(volume = null, muted = muted)
+    }
+
+    private fun sendClientStatePlayer(volume: Int? = null, muted: Boolean? = null) {
+        val player = JSONObject().put("state", "synchronized")
+        volume?.let { player.put("volume", it) }
+        muted?.let { player.put("muted", it) }
+        sendJson("client/state", JSONObject().put("player", player))
     }
 
     private fun sendClientGoodbye(reason: String) {
@@ -346,7 +371,16 @@ class SendspinPcmClient(
                         (0 until arr.length()).joinToString(",") { arr.getString(it) }
                     } ?: ""
 
-                    onUiUpdate { it.copy(status = "server/hello", activeRoles = activeRoles) }
+                    val hasController = activeRoles.contains("controller")
+                    Log.i(tag, "Active roles: $activeRoles, hasController: $hasController")
+
+                    onUiUpdate {
+                        it.copy(
+                            status = "server/hello",
+                            activeRoles = activeRoles,
+                            hasController = hasController
+                        )
+                    }
 
                     startTimeSyncLoop()
                     startPlayoutLoop()
@@ -402,6 +436,48 @@ class SendspinPcmClient(
                     val playbackState = payload.optString("playback_state", "")
                     val groupName = payload.optString("group_name", "")
                     onUiUpdate { it.copy(playbackState = playbackState, groupName = groupName) }
+                }
+
+                "server/state" -> {
+                    val controller = payload.optJSONObject("controller")
+                    if (controller != null) {
+                        val volume = controller.optInt("volume", 100)
+                        val muted = controller.optBoolean("muted", false)
+                        val supportedCommands = controller.optJSONArray("supported_commands")?.let { arr ->
+                            (0 until arr.length()).map { arr.getString(it) }.toSet()
+                        } ?: emptySet()
+
+                        onUiUpdate {
+                            it.copy(
+                                groupVolume = volume,
+                                groupMuted = muted,
+                                supportedCommands = supportedCommands
+                            )
+                        }
+                    }
+                }
+
+                "server/command" -> {
+                    val player = payload.optJSONObject("player")
+                    if (player != null) {
+                        val command = player.optString("command", "")
+                        when (command) {
+                            "volume" -> {
+                                val volume = player.optInt("volume", 100)
+                                Log.i(tag, "server/command volume: $volume (server commanded)")
+                                onUiUpdate { it.copy(playerVolume = volume) }
+                                // Server commanded volume change, echo back in state
+                                sendClientStatePlayer(volume = volume, muted = null)
+                            }
+                            "mute" -> {
+                                val muted = player.optBoolean("mute", false)
+                                Log.i(tag, "server/command mute: $muted (server commanded)")
+                                onUiUpdate { it.copy(playerMuted = muted) }
+                                // Server commanded mute change, echo back in state
+                                sendClientStatePlayer(volume = null, muted = muted)
+                            }
+                        }
+                    }
                 }
             }
         } catch (t: Throwable) {
