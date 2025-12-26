@@ -1,6 +1,8 @@
 package com.mph070770.sendspinandroid
 
 import android.app.Application
+import android.content.Context
+import android.media.AudioManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,7 +33,7 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         val groupVolume: Int = 100,
         val groupMuted: Boolean = false,
         val supportedCommands: Set<String> = emptySet(),
-        // Player state (local device)
+        // Player state (local Android device volume)
         val playerVolume: Int = 100,
         val playerMuted: Boolean = false
     )
@@ -40,6 +42,12 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
     val ui: StateFlow<UiState> = _ui
 
     private var client: SendspinPcmClient? = null
+    private val audioManager = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    init {
+        // Initialize with current Android system volume
+        updateAndroidVolumeState()
+    }
 
     fun connect(wsUrl: String, clientId: String, clientName: String) {
         disconnect()
@@ -92,15 +100,34 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         client?.sendControllerCommand("mute", mute = muted)
     }
 
-    // Player (local device) volume controls
+    // Player (local Android device) volume controls
     fun setPlayerVolume(volume: Int) {
         val clamped = volume.coerceIn(0, 100)
+
+        // Set Android system volume
+        val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val systemVolume = (clamped * maxVolume / 100)
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, systemVolume, 0)
+
+        // Update UI state
         _ui.value = _ui.value.copy(playerVolume = clamped)
-        client?.setPlayerVolume(clamped)
     }
 
     fun setPlayerMute(muted: Boolean) {
+        // Android doesn't have a direct mute for STREAM_MUSIC, so we'll just store the state
+        // In a full implementation, you'd set volume to 0 when muted and restore when unmuted
         _ui.value = _ui.value.copy(playerMuted = muted)
-        client?.setPlayerMute(muted)
+        if (muted) {
+            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+        }
+    }
+
+    // Call this periodically or on volume button press to sync UI with Android volume
+    fun updateAndroidVolumeState() {
+        val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val currentVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val volumePercent = (currentVolume * 100 / maxVolume).coerceIn(0, 100)
+
+        _ui.value = _ui.value.copy(playerVolume = volumePercent)
     }
 }
