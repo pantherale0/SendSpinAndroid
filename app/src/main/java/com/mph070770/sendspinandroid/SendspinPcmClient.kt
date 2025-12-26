@@ -42,7 +42,7 @@ class SendspinPcmClient(
 
     private var playAtServerUs: Long = Long.MIN_VALUE
 
-    // ✅ Realtime playout offset (µs). Negative means "play earlier" (speed up/catch up).
+    // Realtime playout offset (µs). Negative means "play earlier" (speed up/catch up).
     @Volatile private var playoutOffsetUs: Long = 0L
 
     fun setPlayoutOffsetMs(ms: Long) {
@@ -189,45 +189,67 @@ class SendspinPcmClient(
         playoutJob?.cancel()
         playoutJob = scope.launch {
             val targetBufferMs = 200L
+
+            // Normal "too-late" drop once we're running.
             val lateDropUs = 50_000L
 
-            // When offset is changed aggressively, make it audible by catching up (dropping)
-            // or slowing down (waiting) rather than just re-scheduling already-buffered AudioTrack data.
-            val dropLateUs = 80_000L        // if >80ms late, start dropping to catch up
-            val targetLateUs = 20_000L      // stop dropping once within 20ms late
-            val maxEarlySleepMs = 50L       // cap any single sleep so we keep progressing
+            // Make offset changes audible by catching up (dropping) or slowing down (waiting).
+            val dropLateUs = 80_000L
+            val targetLateUs = 20_000L
+            val maxEarlySleepMs = 50L
+
+            // ✅ NEW: if output is stopped and the queue head is very late, we must drop until near-now,
+            // otherwise bufferAheadMs stays negative and we never restart (queue grows forever).
+            val restartKeepWithinUs = 20_000L      // bring head within 20ms late
+            val restartMinAheadMs = -20L           // allow small negative ahead at start
+            val restartMinQueued = 1              // if we have any data after dropping, we can start
 
             while (isActive && isConnected.get()) {
-                val snapshot = jitter.snapshot(clock.estimatedOffsetUs())
+                val offUs = clock.estimatedOffsetUs()
+                val snapshot = jitter.snapshot(offUs)
 
                 onUiUpdate {
                     it.copy(
                         queuedChunks = snapshot.queuedChunks,
                         bufferAheadMs = snapshot.bufferAheadMs,
                         lateDrops = snapshot.lateDrops,
-                        offsetUs = clock.estimatedOffsetUs(),
+                        offsetUs = offUs,
                         driftPpm = clock.estimatedDriftPpm(),
                         rttUs = clock.estimatedRttUs()
                     )
                 }
 
                 if (!output.isStarted()) {
-                    if (codec == "pcm") {
-                        if (snapshot.bufferAheadMs >= targetBufferMs) {
-                            output.start(sampleRate, channels, bitDepth)
-                            sendClientStateSynchronized()
-                            Log.i(tag, "Audio output started sr=$sampleRate ch=$channels bd=$bitDepth")
-                        } else {
-                            delay(10)
-                            continue
-                        }
-                    } else {
+                    if (codec != "pcm") {
                         delay(50)
+                        continue
+                    }
+
+                    // ✅ NEW: prevent deadlock when head is late (negative ahead) by dropping late chunks now.
+                    if (snapshot.queuedChunks > 0 && snapshot.bufferAheadMs < restartMinAheadMs) {
+                        val dropped = jitter.dropWhileLate(nowUs(), offUs, restartKeepWithinUs)
+                        if (dropped > 0) {
+                            Log.w(tag, "restart-catchup: dropped=$dropped head was late (ahead~${snapshot.bufferAheadMs}ms)")
+                        }
+                    }
+
+                    val snap2 = jitter.snapshot(offUs)
+
+                    val canStart =
+                        (snap2.queuedChunks >= restartMinQueued) &&
+                                (snap2.bufferAheadMs >= targetBufferMs || snap2.bufferAheadMs >= restartMinAheadMs)
+
+                    if (canStart) {
+                        output.start(sampleRate, channels, bitDepth)
+                        sendClientStateSynchronized()
+                        Log.i(tag, "Audio output started sr=$sampleRate ch=$channels bd=$bitDepth")
+                    } else {
+                        delay(10)
                         continue
                     }
                 }
 
-                val chunk = jitter.pollPlayable(nowUs(), clock.estimatedOffsetUs(), lateDropUs)
+                val chunk = jitter.pollPlayable(nowUs(), offUs, lateDropUs)
                 if (chunk == null) {
                     if (jitter.isEmpty()) {
                         sendClientStateError()
@@ -241,33 +263,27 @@ class SendspinPcmClient(
                     if (playAtServerUs != Long.MIN_VALUE) maxOf(chunk.serverTimestampUs, playAtServerUs)
                     else chunk.serverTimestampUs
 
-                // ✅ Apply realtime offset here
-                val localPlayUs = (effectiveServerTsUs - clock.estimatedOffsetUs()) + playoutOffsetUs
+                val localPlayUs = (effectiveServerTsUs - offUs) + playoutOffsetUs
                 val now = nowUs()
                 val earlyUs = localPlayUs - now
 
-                // ✅ If we're behind by a lot, drop chunks to catch up (audible effect).
+                // If we're behind by a lot, drop chunks to catch up (audible effect).
                 if (earlyUs < -dropLateUs) {
                     var dropped = 1
                     while (true) {
-                        val next = jitter.pollPlayable(nowUs(), clock.estimatedOffsetUs(), Long.MAX_VALUE) ?: break
-                        val nextLocalPlayUs = (next.serverTimestampUs - clock.estimatedOffsetUs()) + playoutOffsetUs
+                        val next = jitter.pollPlayable(nowUs(), offUs, Long.MAX_VALUE) ?: break
+                        val nextLocalPlayUs = (next.serverTimestampUs - offUs) + playoutOffsetUs
                         val nextEarlyUs = nextLocalPlayUs - nowUs()
-
                         dropped++
                         if (nextEarlyUs >= -targetLateUs) {
                             output.writePcm(next.pcmData)
                             break
                         }
                     }
-                    Log.w(
-                        tag,
-                        "catch-up: late=${(-earlyUs) / 1000}ms dropped=$dropped playoutOffset=${playoutOffsetUs / 1000}ms"
-                    )
+                    Log.w(tag, "catch-up: late=${(-earlyUs) / 1000}ms dropped=$dropped playoutOffset=${playoutOffsetUs / 1000}ms")
                     continue
                 }
 
-                // ✅ If we're early, wait a bit (audible slow-down if pushed positive).
                 if (earlyUs > 5_000) {
                     delay((earlyUs / 1000).coerceAtMost(maxEarlySleepMs))
                 }

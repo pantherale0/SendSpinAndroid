@@ -9,7 +9,6 @@ class AudioJitterBuffer {
         val queuedChunks: Int,
         val bufferAheadMs: Long,
         val lateDrops: Long,
-        // ✅ New: server timestamp (µs) of the earliest queued chunk, or null if empty
         val headServerUs: Long?
     )
 
@@ -50,6 +49,29 @@ class AudioJitterBuffer {
     }
 
     /**
+     * Drop items that are very late compared to nowServerUs, leaving the queue head within keepWithinUs (lateness).
+     * Returns number of chunks dropped.
+     */
+    fun dropWhileLate(nowLocalUs: Long, offsetUs: Long, keepWithinUs: Long): Int {
+        val nowServerUs = nowLocalUs + offsetUs
+        var dropped = 0
+        synchronized(q) {
+            while (true) {
+                val head = q.peek() ?: break
+                val latenessUs = nowServerUs - head.serverTimestampUs
+                if (latenessUs > keepWithinUs) {
+                    q.poll()
+                    lateDropsCounter.incrementAndGet()
+                    dropped++
+                    continue
+                }
+                break
+            }
+        }
+        return dropped
+    }
+
+    /**
      * Returns the next playable chunk (based on local time mapping),
      * dropping anything that is too late.
      */
@@ -60,7 +82,6 @@ class AudioJitterBuffer {
             while (true) {
                 val head = q.peek() ?: return null
 
-                // If too late, drop it.
                 val latenessUs = nowServerUs - head.serverTimestampUs
                 if (latenessUs > lateDropUs) {
                     q.poll()
@@ -68,7 +89,7 @@ class AudioJitterBuffer {
                     continue
                 }
 
-                // If not yet due, let caller wait.
+                // Not "too late" - caller can decide to wait or play.
                 return q.poll()
             }
         }
