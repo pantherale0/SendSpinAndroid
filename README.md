@@ -1,7 +1,7 @@
-# SendSpin Android Player
+# Sendspin Android Player
 
-An Android **SendSpin** client that acts as a synchronized network audio **player** and optional **controller**.
-It connects to a SendSpin-compatible server over WebSocket, receives timestamped PCM or Opus audio frames,
+An Android **Sendspin** client that acts as a synchronized network audio **player** and optional **controller**.
+It connects to a Sendspin-compatible server over WebSocket, receives timestamped PCM or Opus audio frames,
 performs clock synchronisation and jitter buffering, and plays audio in tight sync with other devices.
 
 <img src="ui.png" alt="UI Screenshot" width="50%">
@@ -65,12 +65,12 @@ performs clock synchronisation and jitter buffering, and plays audio in tight sy
    ```
 3. Set a unique `client_id` and name.
 4. Connect.
-5. Adjust **Playout offset** if required to fine-tune sync with other SendSpin players.
+5. Adjust **Playout offset** if required to fine-tune sync with other Sendspin players.
 
 ## Requirements
 
 - Android API 26+
-- SendSpin-compatible server (homeassistant)
+- Sendspin-compatible server (homeassistant)
 
 ## Status
 
