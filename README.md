@@ -20,6 +20,8 @@ performs clock synchronisation and jitter buffering, and plays audio in tight sy
 - **Controller role support**
   - Play / pause / stop / next / previous
   - Group volume and mute
+- **Metadata role support**
+- **Artwork role support**
 - **Modern Android UI**
   - Jetpack Compose UI
   - Live diagnostics: offset, drift, RTT, buffer depth
