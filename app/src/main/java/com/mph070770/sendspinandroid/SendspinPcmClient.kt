@@ -110,14 +110,30 @@ class SendspinPcmClient(
                 playbackState = "",
                 groupName = "",
                 queuedChunks = 0,
-                bufferAheadMs = 0
+                bufferAheadMs = 0,
+                // Clear metadata
+                trackTitle = null,
+                trackArtist = null,
+                albumTitle = null,
+                albumArtist = null,
+                trackYear = null,
+                trackNumber = null,
+                artworkUrl = null,
+                artworkBitmap = null,
+                trackProgress = null,
+                trackDuration = null,
+                playbackSpeed = null,
+                repeatMode = null,
+                shuffleEnabled = null
             )
         }
     }
 
     private fun sendJson(type: String, payload: JSONObject) {
         val obj = JSONObject().put("type", type).put("payload", payload)
-        ws?.send(obj.toString())
+        val json = obj.toString()
+        if (type!="client/time") Log.i(tag, ">>>> SEND: $type | ${json.take(200)}${if (json.length > 200) "..." else ""}")
+        ws?.send(json)
     }
 
     private fun buildPlayerSupportObject(): JSONObject {
@@ -137,16 +153,37 @@ class SendspinPcmClient(
             .put("supported_commands", supportedCommands)
     }
 
+    private fun buildArtworkSupportObject(): JSONObject {
+        // Support one artwork channel (album art)
+        val channel = JSONObject()
+            .put("source", "album")
+            .put("format", "jpeg")
+            .put("media_width", 800)
+            .put("media_height", 800)
+
+        val channels = JSONArray().put(channel)
+
+        return JSONObject().put("channels", channels)
+    }
+
     private fun sendClientHello() {
         val hello = JSONObject()
             .put("client_id", clientId)
             .put("name", clientName)
             .put("version", 1)
-            .put("supported_roles", JSONArray().put("player@v1").put("controller@v1"))
+            .put("supported_roles", JSONArray()
+                .put("player@v1")
+                .put("controller@v1")
+                .put("metadata@v1")
+                .put("artwork@v1"))
 
         val playerSupport = buildPlayerSupportObject()
         hello.put("player@v1_support", playerSupport)
         hello.put("player_support", playerSupport)  // Legacy field for compatibility
+
+        val artworkSupport = buildArtworkSupportObject()
+        hello.put("artwork@v1_support", artworkSupport)
+        hello.put("artwork_support", artworkSupport)  // Legacy field for compatibility
 
         sendJson("client/hello", hello)
         onUiUpdate { it.copy(status = "sent client/hello") }
@@ -220,7 +257,9 @@ class SendspinPcmClient(
     private fun startPlayoutLoop() {
         playoutJob?.cancel()
         playoutJob = scope.launch {
+            // Target buffer for initial start (lower when joining mid-stream)
             val targetBufferMs = 200L
+            val minBufferMs = 20L  // Start immediately if we have at least this much
 
             // Normal "too-late" drop once we're running.
             val lateDropUs = 50_000L
@@ -267,9 +306,11 @@ class SendspinPcmClient(
 
                     val snap2 = jitter.snapshot(offUs)
 
+                    // ✅ CHANGED: Start immediately if we have minimum buffer, or if target is reached
+                    // This allows joining mid-stream to start quickly
                     val canStart =
                         (snap2.queuedChunks >= restartMinQueued) &&
-                                (snap2.bufferAheadMs >= targetBufferMs || snap2.bufferAheadMs >= restartMinAheadMs)
+                                (snap2.bufferAheadMs >= minBufferMs || snap2.bufferAheadMs >= restartMinAheadMs)
 
                     if (canStart) {
                         output.start(sampleRate, channels, bitDepth)
@@ -287,7 +328,7 @@ class SendspinPcmClient(
                         }
 
                         sendClientStateSynchronized()
-                        Log.i(tag, "Audio output started sr=$sampleRate ch=$channels bd=$bitDepth codec=$codec")
+                        Log.i(tag, "Audio output started sr=$sampleRate ch=$channels bd=$bitDepth codec=$codec (buffered=${snap2.bufferAheadMs}ms)")
                     } else {
                         delay(10)
                         continue
@@ -364,6 +405,8 @@ class SendspinPcmClient(
             val type = obj.optString("type", "")
             val payload = obj.optJSONObject("payload") ?: JSONObject()
 
+            if (type!="server/time") Log.i(tag, "<<<< RECV: $type | ${text.take(200)}${if (text.length > 200) "..." else ""}")
+
             when (type) {
                 "server/hello" -> {
                     handshakeComplete = true
@@ -372,13 +415,17 @@ class SendspinPcmClient(
                     } ?: ""
 
                     val hasController = activeRoles.contains("controller")
-                    Log.i(tag, "Active roles: $activeRoles, hasController: $hasController")
+                    val hasMetadata = activeRoles.contains("metadata")
+                    val hasArtwork = activeRoles.contains("artwork")
+                    Log.i(tag, "Active roles: $activeRoles, hasController: $hasController, hasMetadata: $hasMetadata, hasArtwork: $hasArtwork")
 
                     onUiUpdate {
                         it.copy(
                             status = "server/hello",
                             activeRoles = activeRoles,
-                            hasController = hasController
+                            hasController = hasController,
+                            hasMetadata = hasMetadata,
+                            hasArtwork = hasArtwork
                         )
                     }
 
@@ -455,6 +502,118 @@ class SendspinPcmClient(
                             )
                         }
                     }
+
+                    // Handle metadata updates - ONLY update fields that are present
+                    val metadata = payload.optJSONObject("metadata")
+                    if (metadata != null) {
+                        onUiUpdate { currentState ->
+                            var newState = currentState
+
+                            if (metadata.has("timestamp")) {
+                                newState = newState.copy(metadataTimestamp = metadata.getLong("timestamp"))
+                            }
+
+                            if (metadata.has("title")) {
+                                newState = newState.copy(trackTitle = if (metadata.isNull("title")) null else metadata.getString("title"))
+                            }
+
+                            if (metadata.has("artist")) {
+                                newState = newState.copy(trackArtist = if (metadata.isNull("artist")) null else metadata.getString("artist"))
+                            }
+
+                            if (metadata.has("album")) {
+                                newState = newState.copy(albumTitle = if (metadata.isNull("album")) null else metadata.getString("album"))
+                            }
+
+                            if (metadata.has("album_artist")) {
+                                newState = newState.copy(albumArtist = if (metadata.isNull("album_artist")) null else metadata.getString("album_artist"))
+                            }
+
+                            if (metadata.has("year")) {
+                                newState = newState.copy(trackYear = if (metadata.isNull("year")) null else metadata.getInt("year"))
+                            }
+
+                            if (metadata.has("track")) {
+                                newState = newState.copy(trackNumber = if (metadata.isNull("track")) null else metadata.getInt("track"))
+                            }
+
+                            if (metadata.has("artwork_url")) {
+                                val artworkUrl = if (metadata.isNull("artwork_url")) null else metadata.getString("artwork_url")
+                                val currentUrl = newState.artworkUrl
+
+                                newState = newState.copy(artworkUrl = artworkUrl)
+
+                                // If the artwork URL changed, clear the old bitmap and fetch new one
+                                if (artworkUrl != currentUrl) {
+                                    newState = newState.copy(artworkBitmap = null)
+
+                                    if (artworkUrl != null) {
+                                        Log.i(tag, "Fetching artwork from URL: $artworkUrl")
+                                        scope.launch(Dispatchers.IO) {
+                                            try {
+                                                val url = java.net.URL(artworkUrl)
+                                                val connection = url.openConnection()
+                                                connection.connectTimeout = 5000
+                                                connection.readTimeout = 5000
+                                                val inputStream = connection.getInputStream()
+                                                val bitmap = android.graphics.BitmapFactory.decodeStream(inputStream)
+                                                inputStream.close()
+
+                                                if (bitmap != null) {
+                                                    Log.i(tag, "Downloaded artwork from URL: ${bitmap.width}x${bitmap.height}")
+                                                    val config = bitmap.config ?: android.graphics.Bitmap.Config.ARGB_8888
+                                                    val mutableBitmap = bitmap.copy(config, true)
+                                                    onUiUpdate { state ->
+                                                        // Only update if the URL is still the same (avoid race conditions)
+                                                        if (state.artworkUrl == artworkUrl) {
+                                                            state.copy(artworkBitmap = mutableBitmap)
+                                                        } else {
+                                                            state
+                                                        }
+                                                    }
+                                                } else {
+                                                    Log.w(tag, "Failed to decode artwork from URL")
+                                                }
+                                            } catch (e: Exception) {
+                                                Log.e(tag, "Error downloading artwork from URL", e)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Parse progress object
+                            if (metadata.has("progress")) {
+                                val progress = metadata.optJSONObject("progress")
+                                if (progress != null) {
+                                    newState = newState.copy(
+                                        trackProgress = progress.getLong("track_progress"),
+                                        trackDuration = progress.getLong("track_duration"),
+                                        playbackSpeed = progress.getInt("playback_speed")
+                                    )
+                                } else {
+                                    // progress is null - clear it
+                                    newState = newState.copy(
+                                        trackProgress = null,
+                                        trackDuration = null,
+                                        playbackSpeed = null
+                                    )
+                                }
+                            }
+
+                            if (metadata.has("repeat")) {
+                                newState = newState.copy(repeatMode = if (metadata.isNull("repeat")) null else metadata.getString("repeat"))
+                            }
+
+                            if (metadata.has("shuffle")) {
+                                newState = newState.copy(shuffleEnabled = if (metadata.isNull("shuffle")) null else metadata.getBoolean("shuffle"))
+                            }
+
+                            newState
+                        }
+
+                        Log.i(tag, "Metadata update received")
+                    }
                 }
 
                 "server/command" -> {
@@ -481,7 +640,7 @@ class SendspinPcmClient(
                 }
             }
         } catch (t: Throwable) {
-            Log.w(tag, "Bad JSON: ${t.message}")
+            Log.w(tag, "Bad JSON: ${t.message}", t)
         }
     }
 
@@ -490,14 +649,54 @@ class SendspinPcmClient(
         if (data.isEmpty()) return
 
         val type = data[0].toInt() and 0xFF
-        if (type != 4) return
-        if (codec != "pcm" && codec != "opus") return
-        if (data.size < 1 + 8 + 1) return
 
-        val tsServerUs = readInt64BE(data, 1)
-        val encodedData = data.copyOfRange(1 + 8, data.size)
+        when (type) {
+            4 -> {
+                // Audio chunk (player role)
+                if (codec != "pcm" && codec != "opus") return
+                if (data.size < 1 + 8 + 1) return
 
-        jitter.offer(tsServerUs, encodedData, clock.estimatedOffsetUs(), nowUs())
+                val tsServerUs = readInt64BE(data, 1)
+                val encodedData = data.copyOfRange(1 + 8, data.size)
+
+                jitter.offer(tsServerUs, encodedData, clock.estimatedOffsetUs(), nowUs())
+            }
+            8 -> {
+                // Artwork channel 0 (album art)
+                if (data.size < 1 + 8) {
+                    // Empty image - clear artwork
+                    Log.i(tag, "Clearing artwork")
+                    onUiUpdate { it.copy(artworkBitmap = null) }
+                    return
+                }
+
+                val tsServerUs = readInt64BE(data, 1)
+                val imageData = data.copyOfRange(1 + 8, data.size)
+
+                Log.i(tag, "Received artwork binary message, size=${imageData.size} bytes")
+
+                // Decode image in background
+                scope.launch(Dispatchers.Default) {
+                    try {
+                        val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageData, 0, imageData.size)
+                        if (bitmap != null) {
+                            Log.i(tag, "Decoded artwork: ${bitmap.width}x${bitmap.height}")
+                            // Create a mutable copy to ensure it's a new instance that triggers recomposition
+                            val config = bitmap.config ?: android.graphics.Bitmap.Config.ARGB_8888
+                            val mutableBitmap = bitmap.copy(config, true)
+                            onUiUpdate { state ->
+                                Log.i(tag, "Updating UI state with new artwork")
+                                state.copy(artworkBitmap = mutableBitmap)
+                            }
+                        } else {
+                            Log.w(tag, "Failed to decode artwork bitmap - BitmapFactory returned null")
+                        }
+                    } catch (e: Exception) {
+                        Log.e(tag, "Error decoding artwork", e)
+                    }
+                }
+            }
+        }
     }
 
     private fun readInt64BE(buf: ByteArray, off: Int): Long {

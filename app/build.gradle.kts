@@ -12,8 +12,8 @@ android {
         applicationId = "com.mph070770.sendspinandroid"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "0.2"
     }
 
     buildTypes {
@@ -24,6 +24,11 @@ android {
                 "proguard-rules.pro"
             )
         }
+    }
+
+    buildFeatures {
+        compose = true
+        buildConfig = true
     }
 
     compileOptions {
@@ -54,4 +59,7 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.json:json:20240303")
     implementation("io.github.jaredmdobson:concentus:1.0.2")
+
+    implementation("androidx.media:media:1.7.0")
+
 }

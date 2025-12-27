@@ -2,6 +2,7 @@ package com.mph070770.sendspinandroid
 
 import android.app.Application
 import android.content.Context
+import android.graphics.Bitmap
 import android.media.AudioManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -27,7 +28,7 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         val queuedChunks: Int = 0,
         val bufferAheadMs: Long = 0,
         val lateDrops: Long = 0,
-        val playoutOffsetMs: Long = 0,
+        val playoutOffsetMs: Long = -330,  // for Android tablet
         // Controller state (group-wide)
         val hasController: Boolean = false,
         val groupVolume: Int = 100,
@@ -35,7 +36,25 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         val supportedCommands: Set<String> = emptySet(),
         // Player state (local Android device volume)
         val playerVolume: Int = 100,
-        val playerMuted: Boolean = false
+        val playerMuted: Boolean = false,
+        // Metadata state
+        val hasMetadata: Boolean = false,
+        val metadataTimestamp: Long? = null,
+        val trackTitle: String? = null,
+        val trackArtist: String? = null,
+        val albumTitle: String? = null,
+        val albumArtist: String? = null,
+        val trackYear: Int? = null,
+        val trackNumber: Int? = null,
+        val artworkUrl: String? = null,
+        val trackProgress: Long? = null,  // milliseconds
+        val trackDuration: Long? = null,  // milliseconds
+        val playbackSpeed: Int? = null,   // multiplier * 1000 (e.g., 1000 = 1.0x)
+        val repeatMode: String? = null,   // "off", "one", "all"
+        val shuffleEnabled: Boolean? = null,
+        // Artwork state
+        val hasArtwork: Boolean = false,
+        val artworkBitmap: Bitmap? = null
     )
 
     private val _ui = MutableStateFlow(UiState())
@@ -47,6 +66,36 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
     init {
         // Initialize with current Android system volume
         updateAndroidVolumeState()
+    }
+
+    /**
+     * Calculate current track position based on metadata timestamp and playback speed
+     */
+    fun getCurrentTrackPosition(currentServerTimeUs: Long): Long? {
+        val state = _ui.value
+        val timestamp = state.metadataTimestamp ?: return null
+        val progress = state.trackProgress ?: return null
+        val speed = state.playbackSpeed ?: return null
+        val duration = state.trackDuration ?: return null
+
+        if (speed == 0) {
+            // Paused - return the progress at the time of the metadata update
+            return progress
+        }
+
+        // Calculate elapsed time in server's time domain
+        val elapsedUs = currentServerTimeUs - timestamp
+        val elapsedMs = elapsedUs / 1000L
+
+        val speedMultiplier = speed / 1000.0
+        val calculatedProgress = progress + (elapsedMs * speedMultiplier).toLong()
+
+        // Clamp to duration (unless duration is 0 which means unlimited/unknown)
+        return if (duration != 0L) {
+            calculatedProgress.coerceIn(0L, duration)
+        } else {
+            calculatedProgress.coerceAtLeast(0L)
+        }
     }
 
     fun connect(wsUrl: String, clientId: String, clientName: String) {
