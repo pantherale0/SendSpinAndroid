@@ -80,9 +80,7 @@ This project is functional but still experimental.
 The UI exposes internal timing and buffering stats to aid debugging and sync tuning.
 
 Issues:
-- There is possibly a sync/pipeline issue where the playout offset (which is used to match the output of the app to the other playing devices in a group) can vary from one app run to another.  I have found myself using -160mS and -320mS to achieve the same results.  Needs investigation.
 - When a group is playing, and the app is connected, it won't play audio until a track change is forced on music assistant (but I believe this is a server side bug which i've reported to HA)
-- The local/group volume controls aren't working properly
 - .... it hasn't had much testing!
 
 This is vibe coded - so may have unintentional comments and/or code

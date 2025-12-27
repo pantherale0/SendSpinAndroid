@@ -45,8 +45,8 @@ class SendspinPcmClient(
 
     private var playAtServerUs: Long = Long.MIN_VALUE
 
-    // Realtime playout offset (µs). Negative means "play earlier" (speed up/catch up).
-    @Volatile private var playoutOffsetUs: Long = 0L
+    // Pipeline delay offset (µs). Compensates for Android audio pipeline latency.
+    @Volatile private var playoutOffsetUs: Long = -120_000L  // Default -120ms
 
     // Track last sent error state to prevent spam
     private var lastErrorStateSent: Long = 0L
@@ -277,7 +277,7 @@ class SendspinPcmClient(
         playoutJob = scope.launch {
             // Target buffer for initial start (lower when joining mid-stream)
             val targetBufferMs = 200L
-            val minBufferMs = 20L  // Start immediately if we have at least this much
+            val minBufferMs = 200L  // Wait for 200ms buffer before starting playback
 
             // Normal "too-late" drop once we're running.
             val lateDropUs = 50_000L
@@ -287,7 +287,7 @@ class SendspinPcmClient(
             val targetLateUs = 20_000L
             val maxEarlySleepMs = 50L
 
-            // ✅ NEW: if output is stopped and the queue head is very late, we must drop until near-now,
+            // âœ… NEW: if output is stopped and the queue head is very late, we must drop until near-now,
             // otherwise bufferAheadMs stays negative and we never restart (queue grows forever).
             val restartKeepWithinUs = 20_000L      // bring head within 20ms late
             val restartMinAheadMs = -20L           // allow small negative ahead at start
@@ -314,7 +314,7 @@ class SendspinPcmClient(
                         continue
                     }
 
-                    // ✅ NEW: prevent deadlock when head is late (negative ahead) by dropping late chunks now.
+                    // âœ… NEW: prevent deadlock when head is late (negative ahead) by dropping late chunks now.
                     if (snapshot.queuedChunks > 0 && snapshot.bufferAheadMs < restartMinAheadMs) {
                         val dropped = jitter.dropWhileLate(nowUs(), offUs, restartKeepWithinUs)
                         if (dropped > 0) {
@@ -324,7 +324,7 @@ class SendspinPcmClient(
 
                     val snap2 = jitter.snapshot(offUs)
 
-                    // ✅ CHANGED: Start immediately if we have minimum buffer, or if target is reached
+                    // âœ… CHANGED: Start immediately if we have minimum buffer, or if target is reached
                     // This allows joining mid-stream to start quickly
                     val canStart =
                         (snap2.queuedChunks >= restartMinQueued) &&

@@ -32,7 +32,7 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         val queuedChunks: Int = 0,
         val bufferAheadMs: Long = 0,
         val lateDrops: Long = 0,
-        val playoutOffsetMs: Long = -330,
+        val playoutOffsetMs: Long = -300,
         val hasController: Boolean = false,
         val groupVolume: Int = 100,
         val groupMuted: Boolean = false,
