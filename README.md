@@ -59,7 +59,7 @@ performs clock synchronisation and jitter buffering, and plays audio in tight sy
 ## Usage
 
 1. Build and install the app on an Android device.
-2. Enter the WebSocket URL:
+2. Enter the URL of your HomeAssistant (Music Assistant) server:
    ```
    ws://<host>:<port>/sendspin
    ```
