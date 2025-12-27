@@ -4,7 +4,7 @@ An Android **Sendspin** client that acts as a synchronized network audio **playe
 It connects to a Sendspin-compatible server over WebSocket, receives timestamped PCM or Opus audio frames,
 performs clock synchronisation and jitter buffering, and plays audio in tight sync with other devices.
 
-<img src="ui.png" alt="UI Screenshot" width="50%">
+<img src="ui2.png" alt="UI Screenshot" width="40%">
 
 ## Features
 
@@ -20,6 +20,8 @@ performs clock synchronisation and jitter buffering, and plays audio in tight sy
 - **Controller role support**
   - Play / pause / stop / next / previous
   - Group volume and mute
+- **Metadata role support**
+- **Artwork role support**
 - **Modern Android UI**
   - Jetpack Compose UI
   - Live diagnostics: offset, drift, RTT, buffer depth
@@ -79,8 +81,7 @@ The UI exposes internal timing and buffering stats to aid debugging and sync tun
 
 Issues:
 - There is possibly a sync/pipeline issue where the playout offset (which is used to match the output of the app to the other playing devices in a group) can vary from one app run to another.  I have found myself using -160mS and -320mS to achieve the same results.  Needs investigation.
-- Only foreground mode
-- When a group is playing, and the app is connected, it won't play audio until a track change is forced on music assistant
+- When a group is playing, and the app is connected, it won't play audio until a track change is forced on music assistant (but I believe this is a server side bug which i've reported to HA)
 - The local/group volume controls aren't working properly
 - .... it hasn't had much testing!
 

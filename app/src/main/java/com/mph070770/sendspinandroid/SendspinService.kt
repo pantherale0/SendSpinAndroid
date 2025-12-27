@@ -78,6 +78,12 @@ class SendspinService : Service() {
             val clientId = it.getStringExtra("clientId") ?: return@let
             val clientName = it.getStringExtra("clientName") ?: return@let
 
+            // Disconnect existing connection before creating new one
+            if (client != null) {
+                Log.i(tag, "Disconnecting existing client before reconnecting")
+                disconnect()
+            }
+
             connect(wsUrl, clientId, clientName)
         }
 
@@ -208,6 +214,15 @@ class SendspinService : Service() {
     }
 
     fun connect(wsUrl: String, clientId: String, clientName: String) {
+        // Don't create a new connection if we're already connected to the same server
+        if (client != null &&
+            _uiState.value.wsUrl == wsUrl &&
+            _uiState.value.clientId == clientId &&
+            _uiState.value.connected) {
+            Log.i(tag, "Already connected to this server, ignoring duplicate connect request")
+            return
+        }
+
         disconnect()
 
         // Acquire wake lock when connecting
@@ -225,6 +240,7 @@ class SendspinService : Service() {
             wsUrl = wsUrl,
             clientId = clientId,
             clientName = clientName,
+            context = this,
             onUiUpdate = { patch ->
                 _uiState.value = patch(_uiState.value)
                 updateNotification()
@@ -273,5 +289,22 @@ class SendspinService : Service() {
 
     fun setGroupMute(muted: Boolean) {
         client?.sendControllerCommand("mute", mute = muted)
+    }
+
+    // Player (local device) volume controls
+    fun setPlayerVolume(volume: Int) {
+        client?.setPlayerVolume(volume)
+    }
+
+    fun setPlayerMute(muted: Boolean) {
+        client?.setPlayerMute(muted)
+    }
+
+    fun clearPlayerVolumeFlag() {
+        _uiState.value = _uiState.value.copy(playerVolumeFromServer = false)
+    }
+
+    fun clearPlayerMutedFlag() {
+        _uiState.value = _uiState.value.copy(playerMutedFromServer = false)
     }
 }

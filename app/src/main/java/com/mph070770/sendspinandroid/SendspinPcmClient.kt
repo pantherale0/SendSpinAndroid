@@ -13,13 +13,14 @@ class SendspinPcmClient(
     private val wsUrl: String,
     private val clientId: String,
     private val clientName: String,
-    private val onUiUpdate: ((PlayerViewModel.UiState) -> PlayerViewModel.UiState) -> Unit
+    private val onUiUpdate: ((PlayerViewModel.UiState) -> PlayerViewModel.UiState) -> Unit,
+    private val context: android.content.Context
 ) {
     private val tag = "SendspinPcmClient"
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val okHttp = OkHttpClient.Builder()
-        .pingInterval(10, TimeUnit.SECONDS)
+        .pingInterval(30, TimeUnit.SECONDS)  // Increased from 10s to 30s to be more tolerant
         .build()
 
     private var ws: WebSocket? = null
@@ -46,6 +47,10 @@ class SendspinPcmClient(
 
     // Realtime playout offset (µs). Negative means "play earlier" (speed up/catch up).
     @Volatile private var playoutOffsetUs: Long = 0L
+
+    // Track last sent error state to prevent spam
+    private var lastErrorStateSent: Long = 0L
+    private val errorStateThrottleMs = 1000L  // Only send error state once per second
 
     fun setPlayoutOffsetMs(ms: Long) {
         val clamped = ms.coerceIn(-1000L, 1000L)
@@ -76,7 +81,7 @@ class SendspinPcmClient(
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                Log.e(tag, "WS failure", t)
+                Log.e(tag, "WS failure: ${t.message}", t)
                 teardown("failure: ${t.message}")
             }
         })
@@ -200,11 +205,17 @@ class SendspinPcmClient(
         val clamped = volume.coerceIn(0, 100)
         Log.i(tag, "setPlayerVolume: $clamped (local control)")
         sendClientStatePlayer(volume = clamped, muted = null)
+
+        // Update local state immediately without triggering server updates
+        onUiUpdate { it.copy(playerVolume = clamped, playerVolumeFromServer = false) }
     }
 
     fun setPlayerMute(muted: Boolean) {
         Log.i(tag, "setPlayerMute: $muted (local control)")
         sendClientStatePlayer(volume = null, muted = muted)
+
+        // Update local state immediately without triggering server updates
+        onUiUpdate { it.copy(playerMuted = muted, playerMutedFromServer = false) }
     }
 
     private fun sendClientStatePlayer(volume: Int? = null, muted: Boolean? = null) {
@@ -224,6 +235,13 @@ class SendspinPcmClient(
     }
 
     private fun sendClientStateError(volume: Int = 100, muted: Boolean = true) {
+        // Throttle error state messages to prevent spam
+        val now = System.currentTimeMillis()
+        if (now - lastErrorStateSent < errorStateThrottleMs) {
+            return
+        }
+        lastErrorStateSent = now
+
         val player = JSONObject().put("state", "error").put("volume", volume).put("muted", muted)
         sendJson("client/state", JSONObject().put("player", player))
     }
@@ -432,7 +450,14 @@ class SendspinPcmClient(
                     startTimeSyncLoop()
                     startPlayoutLoop()
                     startStatsLoop()
-                    sendClientStateSynchronized()
+
+                    // Send initial state with actual Android volume
+                    val audioManager = context.getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager
+                    val maxVolume = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+                    val currentVolume = audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+                    val volumePercent = (currentVolume * 100 / maxVolume).coerceIn(0, 100)
+
+                    sendClientStateSynchronized(volume = volumePercent, muted = false)
                 }
 
                 "server/time" -> {
@@ -543,40 +568,41 @@ class SendspinPcmClient(
 
                                 newState = newState.copy(artworkUrl = artworkUrl)
 
-                                // If the artwork URL changed, clear the old bitmap and fetch new one
-                                if (artworkUrl != currentUrl) {
-                                    newState = newState.copy(artworkBitmap = null)
+                                // If the artwork URL changed or we don't have artwork yet, fetch it
+                                if (artworkUrl != currentUrl && artworkUrl != null) {
+                                    // Clear old bitmap when URL changes
+                                    if (currentUrl != null) {
+                                        newState = newState.copy(artworkBitmap = null)
+                                    }
 
-                                    if (artworkUrl != null) {
-                                        Log.i(tag, "Fetching artwork from URL: $artworkUrl")
-                                        scope.launch(Dispatchers.IO) {
-                                            try {
-                                                val url = java.net.URL(artworkUrl)
-                                                val connection = url.openConnection()
-                                                connection.connectTimeout = 5000
-                                                connection.readTimeout = 5000
-                                                val inputStream = connection.getInputStream()
-                                                val bitmap = android.graphics.BitmapFactory.decodeStream(inputStream)
-                                                inputStream.close()
+                                    Log.i(tag, "Fetching artwork from URL: $artworkUrl")
+                                    scope.launch(Dispatchers.IO) {
+                                        try {
+                                            val url = java.net.URL(artworkUrl)
+                                            val connection = url.openConnection()
+                                            connection.connectTimeout = 5000
+                                            connection.readTimeout = 5000
+                                            val inputStream = connection.getInputStream()
+                                            val bitmap = android.graphics.BitmapFactory.decodeStream(inputStream)
+                                            inputStream.close()
 
-                                                if (bitmap != null) {
-                                                    Log.i(tag, "Downloaded artwork from URL: ${bitmap.width}x${bitmap.height}")
-                                                    val config = bitmap.config ?: android.graphics.Bitmap.Config.ARGB_8888
-                                                    val mutableBitmap = bitmap.copy(config, true)
-                                                    onUiUpdate { state ->
-                                                        // Only update if the URL is still the same (avoid race conditions)
-                                                        if (state.artworkUrl == artworkUrl) {
-                                                            state.copy(artworkBitmap = mutableBitmap)
-                                                        } else {
-                                                            state
-                                                        }
+                                            if (bitmap != null) {
+                                                Log.i(tag, "Downloaded artwork from URL: ${bitmap.width}x${bitmap.height}")
+                                                val config = bitmap.config ?: android.graphics.Bitmap.Config.ARGB_8888
+                                                val mutableBitmap = bitmap.copy(config, true)
+                                                onUiUpdate { state ->
+                                                    // Only update if the URL is still the same (avoid race conditions)
+                                                    if (state.artworkUrl == artworkUrl) {
+                                                        state.copy(artworkBitmap = mutableBitmap)
+                                                    } else {
+                                                        state
                                                     }
-                                                } else {
-                                                    Log.w(tag, "Failed to decode artwork from URL")
                                                 }
-                                            } catch (e: Exception) {
-                                                Log.e(tag, "Error downloading artwork from URL", e)
+                                            } else {
+                                                Log.w(tag, "Failed to decode artwork from URL")
                                             }
+                                        } catch (e: Exception) {
+                                            Log.e(tag, "Error downloading artwork from URL", e)
                                         }
                                     }
                                 }
@@ -624,15 +650,17 @@ class SendspinPcmClient(
                             "volume" -> {
                                 val volume = player.optInt("volume", 100)
                                 Log.i(tag, "server/command volume: $volume (server commanded)")
-                                onUiUpdate { it.copy(playerVolume = volume) }
-                                // Server commanded volume change, echo back in state
+                                // Update UI state AND notify the onUiUpdate callback so ViewModel can set system volume
+                                onUiUpdate { it.copy(playerVolume = volume, playerVolumeFromServer = true) }
+                                // Echo back in state
                                 sendClientStatePlayer(volume = volume, muted = null)
                             }
                             "mute" -> {
                                 val muted = player.optBoolean("mute", false)
                                 Log.i(tag, "server/command mute: $muted (server commanded)")
-                                onUiUpdate { it.copy(playerMuted = muted) }
-                                // Server commanded mute change, echo back in state
+                                // Update UI state AND notify the onUiUpdate callback
+                                onUiUpdate { it.copy(playerMuted = muted, playerMutedFromServer = true) }
+                                // Echo back in state
                                 sendClientStatePlayer(volume = null, muted = muted)
                             }
                         }

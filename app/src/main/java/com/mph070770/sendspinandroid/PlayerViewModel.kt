@@ -1,9 +1,13 @@
 package com.mph070770.sendspinandroid
 
 import android.app.Application
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.graphics.Bitmap
 import android.media.AudioManager
+import android.os.IBinder
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -28,16 +32,15 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         val queuedChunks: Int = 0,
         val bufferAheadMs: Long = 0,
         val lateDrops: Long = 0,
-        val playoutOffsetMs: Long = -330,  // for Android tablet
-        // Controller state (group-wide)
+        val playoutOffsetMs: Long = -330,
         val hasController: Boolean = false,
         val groupVolume: Int = 100,
         val groupMuted: Boolean = false,
         val supportedCommands: Set<String> = emptySet(),
-        // Player state (local Android device volume)
         val playerVolume: Int = 100,
         val playerMuted: Boolean = false,
-        // Metadata state
+        val playerVolumeFromServer: Boolean = false,
+        val playerMutedFromServer: Boolean = false,
         val hasMetadata: Boolean = false,
         val metadataTimestamp: Long? = null,
         val trackTitle: String? = null,
@@ -47,12 +50,11 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         val trackYear: Int? = null,
         val trackNumber: Int? = null,
         val artworkUrl: String? = null,
-        val trackProgress: Long? = null,  // milliseconds
-        val trackDuration: Long? = null,  // milliseconds
-        val playbackSpeed: Int? = null,   // multiplier * 1000 (e.g., 1000 = 1.0x)
-        val repeatMode: String? = null,   // "off", "one", "all"
+        val trackProgress: Long? = null,
+        val trackDuration: Long? = null,
+        val playbackSpeed: Int? = null,
+        val repeatMode: String? = null,
         val shuffleEnabled: Boolean? = null,
-        // Artwork state
         val hasArtwork: Boolean = false,
         val artworkBitmap: Bitmap? = null
     )
@@ -60,17 +62,76 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui
 
-    private var client: SendspinPcmClient? = null
+    private var service: SendspinService? = null
+    private var serviceBound = false
+
     private val audioManager = app.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val localBinder = binder as? SendspinService.LocalBinder
+            service = localBinder?.getService()
+            serviceBound = true
+
+            service?.let { svc ->
+                viewModelScope.launch {
+                    svc.uiState.collect { serviceState ->
+                        // Handle server-commanded volume changes
+                        if (serviceState.playerVolumeFromServer) {
+                            val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                            val systemVolume = (serviceState.playerVolume * maxVolume / 100)
+                            audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, systemVolume, 0)
+
+                            // Clear the flag in the service
+                            svc.clearPlayerVolumeFlag()
+                        }
+
+                        // Handle server-commanded mute changes
+                        if (serviceState.playerMutedFromServer) {
+                            if (serviceState.playerMuted) {
+                                audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+                            }
+
+                            // Clear the flag in the service
+                            svc.clearPlayerMutedFlag()
+                        }
+
+                        // Only update player volume from service if it's from the server
+                        // This prevents service state from overwriting local UI volume
+                        if (serviceState.playerVolumeFromServer || _ui.value.playerVolume == 100) {
+                            _ui.value = serviceState
+                        } else {
+                            // Keep local volume, update everything else
+                            _ui.value = serviceState.copy(
+                                playerVolume = _ui.value.playerVolume,
+                                playerVolumeFromServer = false
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            service = null
+            serviceBound = false
+        }
+    }
+
     init {
-        // Initialize with current Android system volume
+        val intent = Intent(app, SendspinService::class.java)
+        app.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         updateAndroidVolumeState()
     }
 
-    /**
-     * Calculate current track position based on metadata timestamp and playback speed
-     */
+    override fun onCleared() {
+        super.onCleared()
+        if (serviceBound) {
+            getApplication<Application>().unbindService(serviceConnection)
+            serviceBound = false
+        }
+    }
+
     fun getCurrentTrackPosition(currentServerTimeUs: Long): Long? {
         val state = _ui.value
         val timestamp = state.metadataTimestamp ?: return null
@@ -78,19 +139,13 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         val speed = state.playbackSpeed ?: return null
         val duration = state.trackDuration ?: return null
 
-        if (speed == 0) {
-            // Paused - return the progress at the time of the metadata update
-            return progress
-        }
+        if (speed == 0) return progress
 
-        // Calculate elapsed time in server's time domain
         val elapsedUs = currentServerTimeUs - timestamp
         val elapsedMs = elapsedUs / 1000L
-
         val speedMultiplier = speed / 1000.0
         val calculatedProgress = progress + (elapsedMs * speedMultiplier).toLong()
 
-        // Clamp to duration (unless duration is 0 which means unlimited/unknown)
         return if (duration != 0L) {
             calculatedProgress.coerceIn(0L, duration)
         } else {
@@ -99,84 +154,53 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun connect(wsUrl: String, clientId: String, clientName: String) {
-        disconnect()
-
-        _ui.value = _ui.value.copy(
-            wsUrl = wsUrl,
-            clientId = clientId,
-            clientName = clientName,
-            status = "connecting...",
-            connected = true
-        )
-
-        client = SendspinPcmClient(
-            wsUrl = wsUrl,
-            clientId = clientId,
-            clientName = clientName,
-            onUiUpdate = { patch -> _ui.value = patch(_ui.value) }
-        ).also { it.setPlayoutOffsetMs(_ui.value.playoutOffsetMs) }
-
-        viewModelScope.launch {
-            client?.connect()
-        }
+        SendspinService.startService(getApplication(), wsUrl, clientId, clientName)
     }
 
     fun disconnect() {
-        client?.close("user_disconnect")
-        client = null
+        SendspinService.stopService(getApplication())
         _ui.value = _ui.value.copy(connected = false, status = "disconnected")
     }
 
     fun setPlayoutOffsetMs(ms: Long) {
-        val clamped = ms.coerceIn(-1000L, 1000L)
-        _ui.value = _ui.value.copy(playoutOffsetMs = clamped)
-        client?.setPlayoutOffsetMs(clamped)
+        service?.setPlayoutOffsetMs(ms)
     }
 
-    // Controller commands
-    fun sendPlay() = client?.sendControllerCommand("play")
-    fun sendPause() = client?.sendControllerCommand("pause")
-    fun sendStop() = client?.sendControllerCommand("stop")
-    fun sendNext() = client?.sendControllerCommand("next")
-    fun sendPrevious() = client?.sendControllerCommand("previous")
+    fun sendPlay() = service?.sendPlay()
+    fun sendPause() = service?.sendPause()
+    fun sendStop() = service?.sendStop()
+    fun sendNext() = service?.sendNext()
+    fun sendPrevious() = service?.sendPrevious()
 
     fun setGroupVolume(volume: Int) {
-        val clamped = volume.coerceIn(0, 100)
-        client?.sendControllerCommand("volume", volume = clamped)
+        service?.setGroupVolume(volume)
     }
 
     fun setGroupMute(muted: Boolean) {
-        client?.sendControllerCommand("mute", mute = muted)
+        service?.setGroupMute(muted)
     }
 
-    // Player (local Android device) volume controls
     fun setPlayerVolume(volume: Int) {
         val clamped = volume.coerceIn(0, 100)
-
-        // Set Android system volume
         val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         val systemVolume = (clamped * maxVolume / 100)
         audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, systemVolume, 0)
-
-        // Update UI state
-        _ui.value = _ui.value.copy(playerVolume = clamped)
+        _ui.value = _ui.value.copy(playerVolume = clamped, playerVolumeFromServer = false)
+        service?.setPlayerVolume(clamped)
     }
 
     fun setPlayerMute(muted: Boolean) {
-        // Android doesn't have a direct mute for STREAM_MUSIC, so we'll just store the state
-        // In a full implementation, you'd set volume to 0 when muted and restore when unmuted
-        _ui.value = _ui.value.copy(playerMuted = muted)
+        _ui.value = _ui.value.copy(playerMuted = muted, playerMutedFromServer = false)
         if (muted) {
             audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
         }
+        service?.setPlayerMute(muted)
     }
 
-    // Call this periodically or on volume button press to sync UI with Android volume
     fun updateAndroidVolumeState() {
         val maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
         val currentVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
         val volumePercent = (currentVolume * 100 / maxVolume).coerceIn(0, 100)
-
         _ui.value = _ui.value.copy(playerVolume = volumePercent)
     }
 }
