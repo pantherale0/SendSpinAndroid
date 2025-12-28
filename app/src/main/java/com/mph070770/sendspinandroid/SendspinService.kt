@@ -108,13 +108,13 @@ class SendspinService : Service() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = powerManager.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
-
-        // Register network connectivity receiver
-        registerNetworkReceiver()
             "SendspinService::WakeLock"
         ).apply {
             setReferenceCounted(false)
         }
+
+        // Register network connectivity receiver
+        registerNetworkReceiver()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -142,11 +142,11 @@ class SendspinService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
-        LogUnregister network connectivity receiver
-        unregisterNetworkReceiver()
-
-        // .i(tag, "Service destroyed")
+        Log.i(tag, "Service destroyed")
         disconnect()
+
+        // Unregister network connectivity receiver
+        unregisterNetworkReceiver()
 
         // Release wake lock
         wakeLock?.let {
