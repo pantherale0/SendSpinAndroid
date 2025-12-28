@@ -22,7 +22,6 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.SendSpinAndroid"
         android:usesCleartextTraffic="true">
-        <attribution android:tag="media_playback" android:label="@string/media_playback_attribution" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
