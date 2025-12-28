@@ -1,6 +1,7 @@
 package com.mph070770.sendspinandroid
 
 import android.Manifest
+import android.content.res.Configuration
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
@@ -24,7 +25,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
-import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
     private val vm: PlayerViewModel by viewModels()
@@ -42,19 +42,28 @@ class MainActivity : ComponentActivity() {
         // Ensure system bars remain visible and don't draw behind them
         WindowCompat.setDecorFitsSystemWindows(window, true)
         
-        // Auto-connect if we have saved parameters
-        val prefs = getSharedPreferences("SendspinPlayerPrefs", android.content.Context.MODE_PRIVATE)
-        val savedWsUrl = prefs.getString("ws_url", null)
-        val savedClientName = prefs.getString("client_name", null)
+        // Check if this is a TV device
+        val isTV = (resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK) == Configuration.UI_MODE_TYPE_TELEVISION
         
-        if (!savedWsUrl.isNullOrBlank() && !savedClientName.isNullOrBlank() && savedWsUrl != "ws://192.168.1.137:8927/sendspin") {
-            // Auto-connect with saved parameters
-            vm.connect(savedWsUrl, savedClientName)
-        }
-        
-        // Request NEARBY_WIFI_DEVICES permission on Android 12+
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            nearbyWifiPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+        // For TV devices, enable auto-discovery mode and auto-connect to first server
+        if (isTV) {
+            // Request permissions and start auto-discovery
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                nearbyWifiPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
+            // TV will auto-connect when first server is discovered (handled in PlayerScreen)
+        } else {
+            // For phones/tablets, use saved connection or manual discovery
+            val prefs = getSharedPreferences("SendspinPlayerPrefs", android.content.Context.MODE_PRIVATE)
+            val savedWsUrl = prefs.getString("ws_url", null)
+            val savedClientName = prefs.getString("client_name", null)
+            
+            if (!savedWsUrl.isNullOrBlank() && !savedClientName.isNullOrBlank() && savedWsUrl != "ws://192.168.1.137:8927/sendspin") {
+                // Auto-connect with saved parameters
+                vm.connect(savedWsUrl, savedClientName)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                nearbyWifiPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
+            }
         }
 
         setContent {
@@ -85,6 +94,16 @@ private fun PlayerScreen(vm: PlayerViewModel) {
         vm.updateAndroidVolumeState()
     }
 
+    // On TV devices, auto-connect to first discovered server
+    var autoConnectAttempted by remember { mutableStateOf(false) }
+    LaunchedEffect(discoveredServers, ui.isTV, ui.connected) {
+        if (ui.isTV && !ui.connected && !autoConnectAttempted && discoveredServers.isNotEmpty()) {
+            autoConnectAttempted = true
+            val firstServer = discoveredServers.first()
+            vm.connect(firstServer.url, "Android TV")
+        }
+    }
+
     var wsUrl by remember { mutableStateOf(ui.wsUrl) }
     var clientName by remember { mutableStateOf(ui.clientName) }
     var showServerPicker by remember { mutableStateOf(false) }
@@ -95,52 +114,55 @@ private fun PlayerScreen(vm: PlayerViewModel) {
     ) {
         Text("Sendspin Player", style = MaterialTheme.typography.h5)
 
-        // Discovered servers list
-        if (!ui.connected) {
-            if (discoveredServers.isNotEmpty()) {
-                Text("Available Servers:", style = MaterialTheme.typography.body2)
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .border(1.dp, MaterialTheme.colors.surface)
-                ) {
-                    discoveredServers.forEach { server ->
-                        Button(
-                            onClick = {
-                                wsUrl = server.url
-                            },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(4.dp)
-                        ) {
-                            Column(modifier = Modifier.fillMaxWidth()) {
-                                Text(server.name, style = MaterialTheme.typography.caption)
-                                Text(server.url, style = MaterialTheme.typography.overline, fontSize = 10.sp)
+        // On non-TV devices, show server discovery UI
+        if (!ui.isTV) {
+            // Discovered servers list
+            if (!ui.connected) {
+                if (discoveredServers.isNotEmpty()) {
+                    Text("Available Servers:", style = MaterialTheme.typography.body2)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, MaterialTheme.colors.surface)
+                    ) {
+                        discoveredServers.forEach { server ->
+                            Button(
+                                onClick = {
+                                    wsUrl = server.url
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(4.dp)
+                            ) {
+                                Column(modifier = Modifier.fillMaxWidth()) {
+                                    Text(server.name, style = MaterialTheme.typography.caption)
+                                    Text(server.url, style = MaterialTheme.typography.overline, fontSize = 10.sp)
+                                }
                             }
                         }
                     }
+                    Divider()
+                } else {
+                    Text("Searching for Sendspin servers...", style = MaterialTheme.typography.body2, color = MaterialTheme.colors.primary)
                 }
-                Divider()
-            } else {
-                Text("Searching for Sendspin servers...", style = MaterialTheme.typography.body2, color = MaterialTheme.colors.primary)
-            }
-            OutlinedTextField(
-                value = wsUrl,
-                onValueChange = { wsUrl = it },
-                label = { Text("WebSocket URL (ws://host:port/sendspin)") },
-                singleLine = true,
-                enabled = true,
-                modifier = Modifier.fillMaxWidth()
-            )
+                OutlinedTextField(
+                    value = wsUrl,
+                    onValueChange = { wsUrl = it },
+                    label = { Text("WebSocket URL (ws://host:port/sendspin)") },
+                    singleLine = true,
+                    enabled = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
 
-            OutlinedTextField(
-                value = clientName,
-                onValueChange = { clientName = it },
-                label = { Text("name") },
-                singleLine = true,
-                enabled = true,
-                modifier = Modifier.fillMaxWidth()
-            )
+                OutlinedTextField(
+                    value = clientName,
+                    onValueChange = { clientName = it },
+                    label = { Text("name") },
+                    singleLine = true,
+                    enabled = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
 
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -160,15 +182,17 @@ private fun PlayerScreen(vm: PlayerViewModel) {
         Text("Status: ${ui.status}", maxLines = 2, overflow = TextOverflow.Ellipsis)
         Text("Roles: ${ui.activeRoles.ifBlank { "-" }}")
         
-        // Hide group info on low-memory devices
-        if (!ui.isLowMemoryDevice) {
+        // Hide group info on low-memory and TV devices
+        if (!ui.isLowMemoryDevice && !ui.isTV) {
             Text("Group: ${ui.groupName.ifBlank { "-" }} (${ui.playbackState.ifBlank { "-" }})")
-        } else {
+        } else if (ui.isLowMemoryDevice && !ui.isTV) {
             Text("Low memory device detected, group, metadata, playback and controller info hidden.")
+        } else if (ui.isTV) {
+            Text("TV mode: Auto-discovery enabled, metadata and UI simplified for remote control.")
         }
 
-        // Metadata Display with Album Art - hidden on low-memory devices
-        if (ui.hasMetadata && ui.trackTitle != null && !ui.isLowMemoryDevice) {
+        // Metadata Display with Album Art - hidden on low-memory and TV devices
+        if (ui.hasMetadata && ui.trackTitle != null && !ui.isLowMemoryDevice && !ui.isTV) {
             Divider()
 
             Card(
@@ -351,8 +375,8 @@ private fun PlayerScreen(vm: PlayerViewModel) {
             }
         }
 
-        // Controller Section - hidden on low-memory devices
-        if (ui.hasController && !ui.isLowMemoryDevice) {
+        // Controller Section - hidden on low-memory and TV devices
+        if (ui.hasController && !ui.isLowMemoryDevice && !ui.isTV) {
             Divider()
 
             Text("Group Controls", style = MaterialTheme.typography.h6)
@@ -428,8 +452,8 @@ private fun PlayerScreen(vm: PlayerViewModel) {
             }
         }
 
-        // Player (Local Device) Volume Control - shown when connected with player role (hidden on low-memory devices)
-        if (ui.connected && ui.activeRoles.contains("player") && !ui.isLowMemoryDevice) {
+        // Player (Local Device) Volume Control - shown when connected with player role (hidden on low-memory and TV devices)
+        if (ui.connected && ui.activeRoles.contains("player") && !ui.isLowMemoryDevice && !ui.isTV) {
             Divider()
 
             Text("Local Player Volume", style = MaterialTheme.typography.h6)
@@ -456,8 +480,7 @@ private fun PlayerScreen(vm: PlayerViewModel) {
                 )
             }
         }
-
-        if (ui.connected && ui.activeRoles.contains("player") && !ui.isLowMemoryDevice) {
+        if (ui.connected && ui.activeRoles.contains("player") && !ui.isLowMemoryDevice && !ui.isTV) {
             Divider()
 
             Text("Stream: ${ui.streamDesc.ifBlank { "-" }}")
@@ -492,17 +515,12 @@ private fun PlayerScreen(vm: PlayerViewModel) {
 
 @Composable
 private fun TrackProgressBar(vm: PlayerViewModel, ui: PlayerViewModel.UiState) {
-    // Update progress every 200ms for smooth display
-    var currentProgress by remember { mutableStateOf(0L) }
-
-    LaunchedEffect(ui.trackProgress, ui.playbackSpeed, ui.metadataTimestamp, ui.offsetUs) {
-        while (true) {
-            // Calculate current server time using clock offset
-            val nowLocalUs = System.nanoTime() / 1000L
-            val serverTimeUs = nowLocalUs + ui.offsetUs
-            currentProgress = vm.getCurrentTrackPosition(serverTimeUs) ?: 0L
-            delay(200)
-        }
+    // Calculate current progress WITHOUT triggering recompositions
+    // Only the progress indicator and text recompose, not the whole UI
+    val currentProgress = remember(ui.trackProgress, ui.playbackSpeed, ui.metadataTimestamp, ui.offsetUs) {
+        val nowLocalUs = System.nanoTime() / 1000L
+        val serverTimeUs = nowLocalUs + ui.offsetUs
+        vm.getCurrentTrackPosition(serverTimeUs) ?: 0L
     }
 
     Column {
@@ -541,7 +559,6 @@ private fun TrackProgressBar(vm: PlayerViewModel, ui: PlayerViewModel.UiState) {
         }
     }
 }
-
 private fun formatDuration(ms: Long): String {
     val totalSeconds = (ms / 1000).toInt()
     val minutes = totalSeconds / 60

@@ -9,6 +9,7 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.Configuration
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Build
@@ -36,6 +37,7 @@ class SendspinService : Service() {
 
     // Detect low-memory devices to disable expensive features (initialized in onCreate)
     private var isLowMemoryDevice = false
+    private var isTV = false
     
     private fun checkIsLowMemoryDevice(): Boolean {
         return try {
@@ -49,6 +51,20 @@ class SendspinService : Service() {
             lowMemory
         } catch (e: Exception) {
             Log.w(tag, "Failed to check device memory", e)
+            false
+        }
+    }
+
+    private fun checkIsTV(): Boolean {
+        return try {
+            val uiMode = resources.configuration.uiMode
+            val isTV = (uiMode and Configuration.UI_MODE_TYPE_MASK) == Configuration.UI_MODE_TYPE_TELEVISION
+            if (isTV) {
+                Log.i(tag, "TV device detected: using simplified UI and auto-discovery")
+            }
+            isTV
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to check device type", e)
             false
         }
     }
@@ -100,6 +116,7 @@ class SendspinService : Service() {
         Log.i(tag, "Service created")
         
         // Initialize low-memory detection now that context is ready
+        isTV = checkIsTV()
         isLowMemoryDevice = checkIsLowMemoryDevice()
         
         createNotificationChannel()
@@ -139,7 +156,9 @@ class SendspinService : Service() {
         return START_NOT_STICKY
     }
 
-    override fun onBind(intent: Intent?): IBinder = binder
+    override fun onBind(intent: Intent?): IBinder? {
+        return binder
+    }
 
     override fun onDestroy() {
         Log.i(tag, "Service destroyed")

@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.SharedPreferences
+import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.media.AudioManager
 import android.os.IBinder
@@ -70,11 +71,13 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         val shuffleEnabled: Boolean? = null,
         val hasArtwork: Boolean = false,
         val artworkBitmap: Bitmap? = null,
-        val isLowMemoryDevice: Boolean = false
+        val isLowMemoryDevice: Boolean = false,
+        val isTV: Boolean = false
     )
 
-    private val _ui = MutableStateFlow(UiState(isLowMemoryDevice = checkIsLowMemoryDevice(), playerVolume = getSystemMediaVolume()))
+    private val _ui = MutableStateFlow(UiState(isLowMemoryDevice = checkIsLowMemoryDevice(), playerVolume = getSystemMediaVolume(), isTV = checkIsTV()))
     val ui: StateFlow<UiState> = _ui
+    
     
     private fun checkIsLowMemoryDevice(): Boolean {
         return try {
@@ -82,6 +85,15 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
             val memInfo = android.app.ActivityManager.MemoryInfo()
             activityManager?.getMemoryInfo(memInfo)
             memInfo?.totalMem ?: 0L < 2_000_000_000L  // Less than 2GB total RAM
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun checkIsTV(): Boolean {
+        return try {
+            val uiMode = getApplication<Application>().resources.configuration.uiMode
+            (uiMode and Configuration.UI_MODE_TYPE_MASK) == Configuration.UI_MODE_TYPE_TELEVISION
         } catch (e: Exception) {
             false
         }
