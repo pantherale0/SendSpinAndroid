@@ -26,6 +26,23 @@ class AudioJitterBuffer {
 
     fun isEmpty(): Boolean = synchronized(q) { q.isEmpty() }
 
+    /**
+     * Trim the buffer to keep only the most recent chunks.
+     * Useful for memory pressure situations where we want to keep some buffered audio but reduce memory usage.
+     */
+    fun trimTo(maxChunks: Int) {
+        synchronized(q) {
+            while (q.size > maxChunks) {
+                q.poll()
+            }
+        }
+    }
+
+    /**
+     * Get current buffer size in chunks.
+     */
+    fun size(): Int = synchronized(q) { q.size }
+
     fun offer(serverTsUs: Long, pcm: ByteArray, offsetUs: Long, nowLocalUs: Long) {
         synchronized(q) {
             q.add(Chunk(serverTsUs, pcm))

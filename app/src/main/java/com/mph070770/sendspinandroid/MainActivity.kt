@@ -2,8 +2,10 @@ package com.mph070770.sendspinandroid
 
 import android.Manifest
 import android.content.res.Configuration
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -11,6 +13,8 @@ import androidx.activity.viewModels
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -21,10 +25,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
+import androidx.core.content.edit
 
 class MainActivity : ComponentActivity() {
     private val vm: PlayerViewModel by viewModels()
@@ -42,34 +48,19 @@ class MainActivity : ComponentActivity() {
         // Ensure system bars remain visible and don't draw behind them
         WindowCompat.setDecorFitsSystemWindows(window, true)
         
-        // Check if this is a TV device
-        val isTV = (resources.configuration.uiMode and Configuration.UI_MODE_TYPE_MASK) == Configuration.UI_MODE_TYPE_TELEVISION
+        // Check if we need to show battery optimization warning (only on first launch)
+        val prefs = getSharedPreferences("SendspinPlayerPrefs", MODE_PRIVATE)
+        val shownBatteryWarning = prefs.getBoolean("shown_battery_optimization_warning", false)
         
-        // For TV devices, enable auto-discovery mode and auto-connect to first server
-        if (isTV) {
-            // Request permissions and start auto-discovery
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                nearbyWifiPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
-            }
-            // TV will auto-connect when first server is discovered (handled in PlayerScreen)
-        } else {
-            // For phones/tablets, use saved connection or manual discovery
-            val prefs = getSharedPreferences("SendspinPlayerPrefs", android.content.Context.MODE_PRIVATE)
-            val savedWsUrl = prefs.getString("ws_url", null)
-            val savedClientName = prefs.getString("client_name", null)
-            
-            if (!savedWsUrl.isNullOrBlank() && !savedClientName.isNullOrBlank() && savedWsUrl != "ws://192.168.1.137:8927/sendspin") {
-                // Auto-connect with saved parameters
-                vm.connect(savedWsUrl, savedClientName)
-            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                nearbyWifiPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
-            }
+        // Request NEARBY_WIFI_DEVICES permission for mDNS service discovery
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            nearbyWifiPermissionLauncher.launch(Manifest.permission.NEARBY_WIFI_DEVICES)
         }
 
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    PlayerScreen(vm)
+                    PlayerScreen(vm, showBatteryWarning = !shownBatteryWarning && Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP)
                 }
             }
         }
@@ -85,114 +76,164 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun PlayerScreen(vm: PlayerViewModel) {
+private fun PlayerScreen(vm: PlayerViewModel, showBatteryWarning: Boolean = false) {
     val ui by vm.ui.collectAsState()
     val discoveredServers by vm.discoveredServers.collectAsState()
+    val scrollState = rememberScrollState()
+    var showBatteryDialog by remember { mutableStateOf(showBatteryWarning) }
 
     // Sync with system volume when UI is shown
     LaunchedEffect(Unit) {
         vm.updateAndroidVolumeState()
     }
 
-    // On TV devices, auto-connect to first discovered server
-    var autoConnectAttempted by remember { mutableStateOf(false) }
-    LaunchedEffect(discoveredServers, ui.isTV, ui.connected) {
-        if (ui.isTV && !ui.connected && !autoConnectAttempted && discoveredServers.isNotEmpty()) {
-            autoConnectAttempted = true
-            val firstServer = discoveredServers.first()
-            vm.connect(firstServer.url, "Android TV")
-        }
-    }
-
-    var wsUrl by remember { mutableStateOf(ui.wsUrl) }
-    var clientName by remember { mutableStateOf(ui.clientName) }
-    var showServerPicker by remember { mutableStateOf(false) }
+    var ipAddress by remember { mutableStateOf("") }
+    var port by remember { mutableStateOf("8927") }
+    var showManualEntryDialog by remember { mutableStateOf(false) }
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+            .verticalScroll(scrollState),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         Text("Sendspin Player", style = MaterialTheme.typography.h5)
 
-        // On non-TV devices, show server discovery UI
-        if (!ui.isTV) {
-            // Discovered servers list
-            if (!ui.connected) {
-                if (discoveredServers.isNotEmpty()) {
-                    Text("Available Servers:", style = MaterialTheme.typography.body2)
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .border(1.dp, MaterialTheme.colors.surface)
-                    ) {
-                        discoveredServers.forEach { server ->
-                            Button(
-                                onClick = {
-                                    wsUrl = server.url
-                                },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(4.dp)
-                            ) {
-                                Column(modifier = Modifier.fillMaxWidth()) {
-                                    Text(server.name, style = MaterialTheme.typography.caption)
-                                    Text(server.url, style = MaterialTheme.typography.overline, fontSize = 10.sp)
-                                }
-                            }
-                        }
-                    }
-                    Divider()
-                } else {
-                    Text("Searching for Sendspin servers...", style = MaterialTheme.typography.body2, color = MaterialTheme.colors.primary)
+        // Show discovery status or manual entry prompt
+        if (!ui.connected) {
+            if (discoveredServers.isNotEmpty()) {
+                Text("Available Servers Found:", style = MaterialTheme.typography.body2, color = MaterialTheme.colors.primary)
+                Text("Connecting to: ${discoveredServers.first().name}", style = MaterialTheme.typography.caption)
+            } else if (!ui.discoveryTimeoutExpired) {
+                Text("Searching for Sendspin servers...", style = MaterialTheme.typography.body2, color = MaterialTheme.colors.primary)
+            } else {
+                // Timeout expired, show prompt dialog
+                Button(
+                    onClick = { showManualEntryDialog = true },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Cannot find server, enter IP address?")
                 }
-                OutlinedTextField(
-                    value = wsUrl,
-                    onValueChange = { wsUrl = it },
-                    label = { Text("WebSocket URL (ws://host:port/sendspin)") },
-                    singleLine = true,
-                    enabled = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                OutlinedTextField(
-                    value = clientName,
-                    onValueChange = { clientName = it },
-                    label = { Text("name") },
-                    singleLine = true,
-                    enabled = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
             }
         }
 
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Button(
-                onClick = { vm.connect(wsUrl.trim(), clientName.trim()) },
-                enabled = !ui.connected
-            ) { Text("Connect") }
-
-            OutlinedButton(
-                onClick = { vm.disconnect() },
-                enabled = ui.connected
-            ) { Text("Disconnect") }
+        if (ipAddress.isNotBlank() && port.isNotBlank()) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedButton(
+                    onClick = {
+                        vm.connect(
+                            "ws://${ipAddress}:${port}/sendspin"
+                        )
+                    },
+                    enabled = !ui.connected
+                ) { Text("Connect") }
+                OutlinedButton(
+                    onClick = { vm.disconnect() },
+                    enabled = ui.connected
+                ) { Text("Disconnect") }
+            }
         }
 
         Divider()
 
-        Text("Status: ${ui.status}", maxLines = 2, overflow = TextOverflow.Ellipsis)
-        Text("Roles: ${ui.activeRoles.ifBlank { "-" }}")
-        
-        // Hide group info on low-memory and TV devices
-        if (!ui.isLowMemoryDevice && !ui.isTV) {
-            Text("Group: ${ui.groupName.ifBlank { "-" }} (${ui.playbackState.ifBlank { "-" }})")
-        } else if (ui.isLowMemoryDevice && !ui.isTV) {
-            Text("Low memory device detected, group, metadata, playback and controller info hidden.")
-        } else if (ui.isTV) {
-            Text("TV mode: Auto-discovery enabled, metadata and UI simplified for remote control.")
+        // Manual entry dialog
+        if (showManualEntryDialog) {
+            AlertDialog(
+                onDismissRequest = { showManualEntryDialog = false },
+                title = { Text("Enter Server Details") },
+                text = {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = ipAddress,
+                            onValueChange = { ipAddress = it },
+                            label = { Text("IP Address") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+
+                        OutlinedTextField(
+                            value = port,
+                            onValueChange = { port = it },
+                            label = { Text("Port") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (ipAddress.isNotBlank() && port.isNotBlank()) {
+                                val url = "ws://${ipAddress}:${port}/sendspin"
+                                vm.connect(url)
+                                showManualEntryDialog = false
+                            }
+                        },
+                        enabled = ipAddress.isNotBlank() && port.isNotBlank()
+                    ) {
+                        Text("Connect")
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { showManualEntryDialog = false }
+                    ) {
+                        Text("Cancel")
+                    }
+                }
+            )
         }
 
-        // Metadata Display with Album Art - hidden on low-memory and TV devices
-        if (ui.hasMetadata && ui.trackTitle != null && !ui.isLowMemoryDevice && !ui.isTV) {
+        // Battery optimization warning dialog (Android 12+)
+        if (showBatteryDialog) {
+            val context = LocalContext.current
+            AlertDialog(
+                onDismissRequest = { showBatteryDialog = false },
+                title = { Text("Disable Battery Optimization") },
+                text = {
+                    Text(
+                        "To prevent the app from being stopped by battery optimization, " +
+                        "please disable battery optimization for Sendspin Player in your device settings.\n\n" +
+                        "Tap 'Open Settings' below to go to the battery optimization screen."
+                    )
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            // Open battery optimization settings
+                            val intent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                            intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                            context.startActivity(intent)
+                            // Update prefs to prevent showing again
+                            context.getSharedPreferences("SendspinPlayerPrefs", ComponentActivity.MODE_PRIVATE)
+                                .edit {
+                                    putBoolean("shown_battery_optimization_warning", true)
+                                }
+                            showBatteryDialog = false
+                        }
+                    ) {
+                        Text("Open Settings")
+                    }
+                },
+                dismissButton = {
+                    TextButton(
+                        onClick = { showBatteryDialog = false }
+                    ) {
+                        Text("Dismiss")
+                    }
+                }
+            )
+        }
+        Text("Status: ${ui.status}", maxLines = 2, overflow = TextOverflow.Ellipsis)
+        Text("Roles: ${ui.activeRoles.ifBlank { "-" }}")
+        Text("Group: ${ui.groupName.ifBlank { "-" }} (${ui.playbackState.ifBlank { "-" }})")
+
+        // Metadata Display with Album Art
+        if (ui.connected && ui.hasMetadata && ui.trackTitle != null && !ui.isLowMemoryDevice) {
             Divider()
 
             Card(
@@ -375,8 +416,8 @@ private fun PlayerScreen(vm: PlayerViewModel) {
             }
         }
 
-        // Controller Section - hidden on low-memory and TV devices
-        if (ui.hasController && !ui.isLowMemoryDevice && !ui.isTV) {
+        // Controller Section
+        if (ui.hasController && !ui.isLowMemoryDevice) {
             Divider()
 
             Text("Group Controls", style = MaterialTheme.typography.h6)
@@ -452,8 +493,8 @@ private fun PlayerScreen(vm: PlayerViewModel) {
             }
         }
 
-        // Player (Local Device) Volume Control - shown when connected with player role (hidden on low-memory and TV devices)
-        if (ui.connected && ui.activeRoles.contains("player") && !ui.isLowMemoryDevice && !ui.isTV) {
+        // Player (Local Device) Volume Control - shown when connected with player role
+        if (ui.connected && ui.activeRoles.contains("player") && !ui.isLowMemoryDevice) {
             Divider()
 
             Text("Local Player Volume", style = MaterialTheme.typography.h6)
@@ -480,7 +521,9 @@ private fun PlayerScreen(vm: PlayerViewModel) {
                 )
             }
         }
-        if (ui.connected && ui.activeRoles.contains("player") && !ui.isLowMemoryDevice && !ui.isTV) {
+
+        // Debug information - only show in debug builds
+        if (ui.connected && ui.activeRoles.contains("player") && !ui.isLowMemoryDevice && BuildConfig.DEBUG) {
             Divider()
 
             Text("Stream: ${ui.streamDesc.ifBlank { "-" }}")
@@ -496,14 +539,16 @@ private fun PlayerScreen(vm: PlayerViewModel) {
         }
 
         // Playout offset knob
-        Text("Playout offset: ${ui.playoutOffsetMs}ms  (neg = earlier / catch up)")
-        Slider(
-            value = ui.playoutOffsetMs.toFloat(),
-            onValueChange = { vm.setPlayoutOffsetMs(it.toLong()) },
-            valueRange = -1000f..1000f,
-            steps = 200,
-            modifier = Modifier.fillMaxWidth()
-        )
+        if (ui.connected && ui.activeRoles.contains("player")) {
+            Text("Playout offset: ${ui.playoutOffsetMs}ms  (neg = earlier / catch up)")
+            Slider(
+                value = ui.playoutOffsetMs.toFloat(),
+                onValueChange = { vm.setPlayoutOffsetMs(it.toLong()) },
+                valueRange = -1000f..1000f,
+                steps = 200,
+                modifier = Modifier.fillMaxWidth()
+            )
+        }
 
         Spacer(Modifier.weight(1f))
         Text(

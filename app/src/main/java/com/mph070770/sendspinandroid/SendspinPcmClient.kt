@@ -48,6 +48,18 @@ class SendspinPcmClient(
         }
     }
 
+    private fun getActualSystemVolume(): Int {
+        return try {
+            val audioManager = context.getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager
+            val maxVolume = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+            val currentVolume = audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+            (currentVolume * 100 / maxVolume).coerceIn(0, 100)
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to get system volume", e)
+            100  // Default to max if we can't read
+        }
+    }
+
     private val clock = ClockSync()
     private val jitter = AudioJitterBuffer()
     private val output: PcmAudioOutput = PcmAudioOutput()
@@ -77,6 +89,10 @@ class SendspinPcmClient(
     private var lastErrorStateSent: Long = 0L
     private val errorStateThrottleMs = 1000L  // Only send error state once per second
 
+    // Throttle UI updates to prevent excessive recomposition on low-memory devices
+    private var lastUiUpdateUs: Long = 0L
+    private val uiUpdateThrottleMs = if (isLowMemoryDevice) 300L else 50L  // Update less frequently on low-memory devices
+
     fun setPlayoutOffsetMs(ms: Long) {
         val clamped = ms.coerceIn(-1000L, 1000L)
         playoutOffsetUs = clamped * 1000L
@@ -86,7 +102,9 @@ class SendspinPcmClient(
     suspend fun connect() {
         val req = Request.Builder().url(wsUrl).build()
 
-        onUiUpdate { it.copy(status = "connecting...", connected = false) }
+        // Initialize UI with actual system volume before connecting
+        val actualVolume = getActualSystemVolume()
+        onUiUpdate { it.copy(status = "connecting...", connected = false, groupVolume = actualVolume) }
 
         ws = okHttp.newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
@@ -172,6 +190,14 @@ class SendspinPcmClient(
         
         // Calculate moving average
         decodeLatencyUs = decodeLatencySamples.average().toLong()
+    }
+
+    private fun throttledUiUpdate(block: (PlayerViewModel.UiState) -> PlayerViewModel.UiState) {
+        val now = nowUs()
+        if (now - lastUiUpdateUs >= uiUpdateThrottleMs * 1000L) {
+            lastUiUpdateUs = now
+            onUiUpdate(block)
+        }
     }
 
     private fun sendJson(type: String, payload: JSONObject) {
@@ -313,13 +339,57 @@ class SendspinPcmClient(
         statsJob = scope.launch {
             while (isActive && isConnected.get()) {
                 val snapshot = jitter.snapshot(clock.estimatedOffsetUs())
-                Log.i(
-                    tag,
-                    "stats: offset=${clock.estimatedOffsetUs()}us drift=${String.format("%.3f", clock.estimatedDriftPpm())}ppm " +
-                            "rtt~=${clock.estimatedRttUs()}us queued=${snapshot.queuedChunks} ahead~=${snapshot.bufferAheadMs}ms " +
-                            "codec=$codec decodeLatency=${decodeLatencyUs / 1000}µs playoutOffset=${playoutOffsetUs / 1000}ms"
-                )
+                // Skip detailed stats logging on low-memory devices to reduce memory pressure
+                if (!isLowMemoryDevice) {
+                    Log.i(
+                        tag,
+                        "stats: offset=${clock.estimatedOffsetUs()}us drift=${String.format("%.3f", clock.estimatedDriftPpm())}ppm " +
+                                "rtt~=${clock.estimatedRttUs()}us queued=${snapshot.queuedChunks} ahead~=${snapshot.bufferAheadMs}ms " +
+                                "codec=$codec decodeLatency=${decodeLatencyUs / 1000}µs playoutOffset=${playoutOffsetUs / 1000}ms"
+                    )
+                }
                 delay(3000L)
+            }
+        }
+    }
+
+    private fun startMemoryMonitoringLoop() {
+        // Only run memory monitoring on low-memory devices
+        if (!isLowMemoryDevice) return
+        
+        scope.launch {
+            while (isActive && isConnected.get()) {
+                try {
+                    val activityManager = context.getSystemService(android.content.Context.ACTIVITY_SERVICE) as? ActivityManager
+                    val memInfo = ActivityManager.MemoryInfo()
+                    activityManager?.getMemoryInfo(memInfo)
+
+                    val availableMemMb = (memInfo?.availMem ?: 0L) / (1024 * 1024)
+                    val totalMemMb = (memInfo?.totalMem ?: 0L) / (1024 * 1024)
+                    val freePercentage = if (totalMemMb > 0) (availableMemMb * 100 / totalMemMb) else 0
+
+                    // Only log occasionally to avoid spam
+                    if (isActive) {
+                        Log.d(tag, "Memory: ${availableMemMb}MB available of ${totalMemMb}MB (${freePercentage}%)")
+                    }
+
+                    // Respond to memory pressure
+                    if (memInfo?.lowMemory == true) {
+                        Log.w(tag, "System lowMemory flag set, trimming buffer")
+                        trimAudioBufferLow()
+                    } else if (availableMemMb < 50) {
+                        Log.e(tag, "Critical memory available (${availableMemMb}MB), clearing buffer")
+                        trimAudioBufferCritical()
+                    } else if (availableMemMb < 100) {
+                        Log.w(tag, "Low memory available (${availableMemMb}MB), doing moderate trim")
+                        trimAudioBufferModerate()
+                    }
+                } catch (e: Exception) {
+                    Log.w(tag, "Error during memory monitoring", e)
+                }
+
+                // Check every 5 seconds
+                delay(5000L)
             }
         }
     }
@@ -349,7 +419,8 @@ class SendspinPcmClient(
                 val offUs = clock.estimatedOffsetUs()
                 val snapshot = jitter.snapshot(offUs)
 
-                onUiUpdate {
+                // Throttle UI updates to prevent excessive recomposition on low-memory devices
+                throttledUiUpdate {
                     it.copy(
                         queuedChunks = snapshot.queuedChunks,
                         bufferAheadMs = snapshot.bufferAheadMs,
@@ -408,6 +479,7 @@ class SendspinPcmClient(
                 val chunk = jitter.pollPlayable(nowUs(), offUs, lateDropUs)
                 if (chunk == null) {
                     if (jitter.isEmpty()) {
+                        // Throttle error state messages to prevent spam (already throttled in sendClientStateError)
                         sendClientStateError()
                         output.flushSilence(20)
                     }
@@ -444,6 +516,7 @@ class SendspinPcmClient(
                 // If we're behind by a lot, drop chunks to catch up (audible effect).
                 if (earlyUs < -dropLateUs) {
                     var dropped = 1
+                    var lastYieldTime = now
                     while (true) {
                         val next = jitter.pollPlayable(nowUs(), offUs, Long.MAX_VALUE) ?: break
                         val nextPcm = if (codec == "opus") {
@@ -455,7 +528,9 @@ class SendspinPcmClient(
                             next.pcmData
                         }
 
-                        val nextLocalPlayUs = (next.serverTimestampUs - offUs) + playoutOffsetUs
+                        // Apply same decode latency compensation during catch-up as during normal playback
+                        val nextTotalPlayoutOffsetUs = playoutOffsetUs - decodeLatencyUs
+                        val nextLocalPlayUs = (next.serverTimestampUs - offUs) + nextTotalPlayoutOffsetUs
                         val nextEarlyUs = nextLocalPlayUs - nowUs()
                         dropped++
                         if (nextEarlyUs >= -targetLateUs) {
@@ -463,6 +538,10 @@ class SendspinPcmClient(
                                 output.writePcm(nextPcm)
                             }
                             break
+                        }
+                        // Yield periodically during catch-up to prevent blocking other threads on slow devices
+                        if (dropped % 10 == 0) {
+                            yield()
                         }
                     }
                     Log.w(tag, "catch-up: late=${(-earlyUs) / 1000}ms dropped=$dropped playoutOffset=${playoutOffsetUs / 1000}ms")
@@ -507,17 +586,13 @@ class SendspinPcmClient(
                             hasArtwork = hasArtwork
                         )
                     }
-
                     startTimeSyncLoop()
                     startPlayoutLoop()
                     startStatsLoop()
+                    startMemoryMonitoringLoop()
 
                     // Send initial state with actual Android volume
-                    val audioManager = context.getSystemService(android.content.Context.AUDIO_SERVICE) as android.media.AudioManager
-                    val maxVolume = audioManager.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
-                    val currentVolume = audioManager.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
-                    val volumePercent = (currentVolume * 100 / maxVolume).coerceIn(0, 100)
-
+                    val volumePercent = getActualSystemVolume()
                     sendClientStateSynchronized(volume = volumePercent, muted = false)
                 }
 
@@ -795,4 +870,31 @@ class SendspinPcmClient(
     }
 
     private fun nowUs(): Long = System.nanoTime() / 1000L
+
+    // Memory pressure management
+    fun trimAudioBufferCritical() {
+        Log.e(tag, "CRITICAL memory trim: clearing audio buffer completely")
+        jitter.clear()
+        opusDecoder = null
+        // Update UI to reflect buffer clear
+        onUiUpdate { it.copy(queuedChunks = 0, bufferAheadMs = 0) }
+    }
+
+    fun trimAudioBufferModerate() {
+        val currentSize = jitter.size()
+        val targetSize = (currentSize / 2).coerceAtLeast(50)
+        Log.w(tag, "MODERATE memory trim: reducing buffer from $currentSize to $targetSize chunks")
+        jitter.trimTo(targetSize)
+        val snapshot = jitter.snapshot(clock.estimatedOffsetUs())
+        onUiUpdate { it.copy(queuedChunks = snapshot.queuedChunks, bufferAheadMs = snapshot.bufferAheadMs) }
+    }
+
+    fun trimAudioBufferLow() {
+        val currentSize = jitter.size()
+        val targetSize = (currentSize * 3 / 4).coerceAtLeast(100)
+        Log.w(tag, "LOW memory trim: reducing buffer from $currentSize to $targetSize chunks")
+        jitter.trimTo(targetSize)
+        val snapshot = jitter.snapshot(clock.estimatedOffsetUs())
+        onUiUpdate { it.copy(queuedChunks = snapshot.queuedChunks, bufferAheadMs = snapshot.bufferAheadMs) }
+    }
 }

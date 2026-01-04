@@ -22,13 +22,12 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         private const val PREFS_NAME = "SendspinPlayerPrefs"
         private const val KEY_WS_URL = "ws_url"
-        private const val KEY_CLIENT_NAME = "client_name"
         private const val DEFAULT_WS_URL = "ws://192.168.1.137:8927/sendspin"
         private const val DEFAULT_CLIENT_NAME = "Android Player"
     }
 
     private val sharedPrefs: SharedPreferences = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    private val deviceId: String = Settings.Secure.getString(app.contentResolver, Settings.Secure.ANDROID_ID) ?: "android-player"
+    private val deviceId: String = getOrCreateDeviceId()
 
     data class UiState(
         val wsUrl: String = "ws://192.168.1.137:8927/sendspin",
@@ -46,7 +45,7 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         val queuedChunks: Int = 0,
         val bufferAheadMs: Long = 0,
         val lateDrops: Long = 0,
-        val playoutOffsetMs: Long = -300,
+        val playoutOffsetMs: Long = 0,
         val hasController: Boolean = false,
         val groupVolume: Int = 100,
         val groupMuted: Boolean = false,
@@ -72,7 +71,8 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         val hasArtwork: Boolean = false,
         val artworkBitmap: Bitmap? = null,
         val isLowMemoryDevice: Boolean = false,
-        val isTV: Boolean = false
+        val isTV: Boolean = false,
+        val discoveryTimeoutExpired: Boolean = false
     )
 
     private val _ui = MutableStateFlow(UiState(isLowMemoryDevice = checkIsLowMemoryDevice(), playerVolume = getSystemMediaVolume(), isTV = checkIsTV()))
@@ -107,6 +107,17 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         } catch (e: Exception) {
             100
         }
+    }
+
+    private fun getOrCreateDeviceId(): String {
+        var deviceId = sharedPrefs.getString("device_id", null)
+        if (deviceId == null) {
+            // Use hardware device identifier that's unique per device and persists across reinstalls
+            // ANDROID_ID is the standard way for regular apps to get a stable device identifier
+            deviceId = Settings.Secure.getString(getApplication<Application>().contentResolver, Settings.Secure.ANDROID_ID) ?: "unknown"
+            sharedPrefs.edit().putString("device_id", deviceId).apply()
+        }
+        return deviceId
     }
 
     private val serviceDiscovery = ServiceDiscovery(app)
@@ -170,26 +181,60 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         // Load saved settings from SharedPreferences
-        val savedWsUrl = sharedPrefs.getString(KEY_WS_URL, DEFAULT_WS_URL) ?: DEFAULT_WS_URL
-        val savedClientName = sharedPrefs.getString(KEY_CLIENT_NAME, DEFAULT_CLIENT_NAME) ?: DEFAULT_CLIENT_NAME
+        val savedWsUrl = sharedPrefs.getString(KEY_WS_URL, null)
         
+        // Initialize with saved URL if available, otherwise empty
         _ui.value = _ui.value.copy(
-            wsUrl = savedWsUrl,
+            wsUrl = savedWsUrl ?: "",
             clientId = deviceId,
-            clientName = savedClientName
+            clientName = DEFAULT_CLIENT_NAME
         )
         
         updateAndroidVolumeState()
 
+        // If we have a saved server URL, connect to it immediately
+        if (!savedWsUrl.isNullOrBlank()) {
+            connect(savedWsUrl)
+        }
+
         // Start mDNS service discovery
         serviceDiscovery.startDiscovery()
         
-        // If we have a saved configuration that's not the default, try to connect at startup
-        if (savedWsUrl != DEFAULT_WS_URL) {
-            viewModelScope.launch {
-                // Give the UI a moment to initialize before auto-connecting
-                kotlinx.coroutines.delay(500)
-                connect(savedWsUrl, savedClientName)
+        // Set a 5-second timeout for discovery
+        viewModelScope.launch {
+            kotlinx.coroutines.delay(5000) // 5 seconds
+            // Mark that discovery timeout has expired (this allows fallback to manual entry)
+            _ui.value = _ui.value.copy(discoveryTimeoutExpired = true)
+        }
+        
+        // Monitor discovered servers and auto-connect to the first one
+        viewModelScope.launch {
+            serviceDiscovery.discoveredServers.collect { servers ->
+                val currentState = _ui.value
+                // Auto-connect to the first discovered server if not already connected
+                if (!currentState.connected && servers.isNotEmpty()) {
+                    val firstServer = servers.first()
+                    
+                    // Connect to first discovered server
+                    connect(firstServer.url)
+                }
+            }
+        }
+
+        // Monitor connection state to reset discovery timeout when disconnected
+        viewModelScope.launch {
+            ui.collect { uiState ->
+                // When we lose connection, reset the discovery timeout so we can search again
+                if (!uiState.connected && _ui.value.discoveryTimeoutExpired) {
+                    // Reset the timeout and restart the countdown
+                    _ui.value = _ui.value.copy(discoveryTimeoutExpired = false)
+                    
+                    // Restart the 5-second discovery timeout
+                    viewModelScope.launch {
+                        kotlinx.coroutines.delay(5000) // 5 seconds
+                        _ui.value = _ui.value.copy(discoveryTimeoutExpired = true)
+                    }
+                }
             }
         }
     }
@@ -224,12 +269,10 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun connect(wsUrl: String, clientName: String) {
+    fun connect(wsUrl: String) {
         // Save settings to SharedPreferences
         sharedPrefs.edit().apply {
             putString(KEY_WS_URL, wsUrl)
-            putString(KEY_CLIENT_NAME, clientName)
-            putBoolean("auto_start_on_boot", true)  // Enable auto-start now that user has connected
             apply()
         }
         
@@ -239,7 +282,7 @@ class PlayerViewModel(app: Application) : AndroidViewModel(app) {
             getApplication<Application>().bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
         }
         
-        SendspinService.startService(getApplication(), wsUrl, deviceId, clientName)
+        SendspinService.startService(getApplication(), wsUrl, deviceId, DEFAULT_CLIENT_NAME)
     }
 
     fun selectDiscoveredServer(server: DiscoveredServer) {

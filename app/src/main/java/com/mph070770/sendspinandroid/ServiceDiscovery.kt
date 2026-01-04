@@ -83,6 +83,7 @@ class ServiceDiscovery(private val context: Context) {
             override fun onServiceResolved(service: NsdServiceInfo) {
                 Log.i(tag, "Service resolved: ${service.serviceName}")
 
+                @Suppress("DEPRECATION")
                 val host = service.host?.hostAddress
                 Log.d(tag, "Resolved host: $host, port: ${service.port}")
                 

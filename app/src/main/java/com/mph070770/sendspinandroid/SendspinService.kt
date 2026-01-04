@@ -7,6 +7,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.content.BroadcastReceiver
+import android.content.ComponentCallbacks2
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.res.Configuration
@@ -38,6 +39,11 @@ class SendspinService : Service() {
     // Detect low-memory devices to disable expensive features (initialized in onCreate)
     private var isLowMemoryDevice = false
     private var isTV = false
+    
+    // Reconnection retry tracking
+    private var reconnectJob: Job? = null
+    private var reconnectRetryCount = 0
+    private val MAX_RECONNECT_RETRIES = 10
     
     private fun checkIsLowMemoryDevice(): Boolean {
         return try {
@@ -72,6 +78,9 @@ class SendspinService : Service() {
     // Track notification state to avoid redundant updates
     private var lastNotificationState: NotificationState? = null
 
+    // Track if service was started from boot context to handle Android 12+ restrictions
+    private var startedFromBoot: Boolean = false
+    
     // Network connectivity receiver for auto-reconnect
     private var connectivityReceiver: BroadcastReceiver? = null
     private var lastNetworkState: Boolean = false
@@ -132,12 +141,32 @@ class SendspinService : Service() {
 
         // Register network connectivity receiver
         registerNetworkReceiver()
+
+        // Register memory trim callbacks to respond to system memory pressure
+        registerComponentCallbacks(createMemoryTrimCallback())
+
+        // Monitor connection state and auto-reconnect on failures
+        scope.launch {
+            _uiState.collect { state ->
+                // If connection failed and we're not already retrying, start auto-reconnect
+                if (state.status.startsWith("failure:") && reconnectJob == null) {
+                    Log.i(tag, "Connection failed, starting auto-reconnect")
+                    startAutoReconnect(state.wsUrl, state.clientId, state.clientName)
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(tag, "Service started")
-        // Start foreground immediately
-        startForeground(NOTIFICATION_ID, createNotification())
+        // Detect if this is from a boot receiver (no connection parameters provided)
+        val fromBoot = intent?.getStringExtra("fromBoot") == "1"
+        
+        // Track that this service instance started from boot
+        if (fromBoot) {
+            startedFromBoot = true
+            Log.i(tag, "Service started from boot context")
+        }
 
         intent?.let {
             val wsUrl = it.getStringExtra("wsUrl") ?: return@let
@@ -150,7 +179,7 @@ class SendspinService : Service() {
                 disconnect()
             }
 
-            connect(wsUrl, clientId, clientName)
+            connect(wsUrl, clientId, clientName, fromBoot = fromBoot)
         }
 
         return START_NOT_STICKY
@@ -184,11 +213,12 @@ class SendspinService : Service() {
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Sendspin Playback",
-                NotificationManager.IMPORTANCE_DEFAULT
+                NotificationManager.IMPORTANCE_LOW
             ).apply {
                 description = "Sendspin music playback - keeps service running"
                 setShowBadge(false)
                 enableVibration(false)
+                setSound(null, null)
             }
 
             val notificationManager = getSystemService(NotificationManager::class.java)
@@ -282,13 +312,6 @@ class SendspinService : Service() {
             }
         }
 
-        // Use media style with only the actions that were actually added
-        val mediaStyle = androidx.media.app.NotificationCompat.MediaStyle()
-        if (actionIndices.isNotEmpty()) {
-            mediaStyle.setShowActionsInCompactView(*actionIndices.toIntArray())
-        }
-        builder.setStyle(mediaStyle)
-
         return builder.build()
     }
 
@@ -323,13 +346,13 @@ class SendspinService : Service() {
         }
     }
 
-    fun connect(wsUrl: String, clientId: String, clientName: String) {
-        // Don't create a new connection if we're already connected to the same server
+    fun connect(wsUrl: String, clientId: String, clientName: String, fromBoot: Boolean = false) {
+        // Don't create a new connection if we're already connected or connecting to the same server
         if (client != null &&
             _uiState.value.wsUrl == wsUrl &&
             _uiState.value.clientId == clientId &&
-            _uiState.value.connected) {
-            Log.i(tag, "Already connected to this server, ignoring duplicate connect request")
+            (_uiState.value.connected || _uiState.value.status.startsWith("connecting"))) {
+            Log.i(tag, "Already connected/connecting to this server, ignoring duplicate connect request")
             return
         }
 
@@ -337,6 +360,10 @@ class SendspinService : Service() {
 
         // Acquire wake lock when connecting
         wakeLock?.acquire()
+
+        // Start foreground service with retry logic for Android 12+ BOOT_COMPLETED restrictions
+        // Use startedFromBoot flag to track if service was initially started from boot context
+        startForegroundWithRetry(fromBoot = startedFromBoot || fromBoot)
 
         _uiState.value = _uiState.value.copy(
             wsUrl = wsUrl,
@@ -364,9 +391,40 @@ class SendspinService : Service() {
         }
     }
 
+    private fun startForegroundWithRetry(retryCount: Int = 0, fromBoot: Boolean = false) {
+        // Android 12+ restricts BOOT_COMPLETED receivers from starting mediaPlayback foreground services
+        // The boot receiver now uses startService() instead, so this only handles non-boot contexts
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && fromBoot) {
+            Log.i(tag, "Skipping foreground service start from boot context on Android 12+ (background service mode)")
+            return
+        }
+
+        try {
+            startForeground(NOTIFICATION_ID, createNotification())
+            Log.i(tag, "Foreground service started successfully")
+        } catch (e: Exception) {
+            // May still fail if called from certain restricted contexts
+            // Retry after a short delay
+            if (retryCount < 5) {
+                Log.w(tag, "Failed to start foreground service, retrying... (attempt ${retryCount + 1})", e)
+                scope.launch {
+                    delay(1000L * (retryCount + 1))
+                    startForegroundWithRetry(retryCount + 1, fromBoot = fromBoot)
+                }
+            } else {
+                Log.e(tag, "Failed to start foreground service after retries", e)
+            }
+        }
+    }
+
     fun disconnect() {
         client?.close("user_disconnect")
         client = null
+        
+        // Cancel any pending reconnect attempts
+        reconnectJob?.cancel()
+        reconnectJob = null
+        reconnectRetryCount = 0
 
         // Release wake lock when disconnecting
         wakeLock?.let {
@@ -377,6 +435,37 @@ class SendspinService : Service() {
 
         _uiState.value = _uiState.value.copy(connected = false, status = "disconnected")
         updateNotification()
+    }
+
+    private fun startAutoReconnect(wsUrl: String, clientId: String, clientName: String) {
+        // Cancel any existing reconnect job
+        reconnectJob?.cancel()
+        reconnectRetryCount = 0
+        
+        reconnectJob = scope.launch {
+            while (reconnectRetryCount < MAX_RECONNECT_RETRIES) {
+                val delayMs = (1000L * Math.pow(2.0, reconnectRetryCount.toDouble())).toLong().coerceAtMost(60000L)
+                Log.i(tag, "Reconnect attempt ${reconnectRetryCount + 1}/$MAX_RECONNECT_RETRIES, waiting ${delayMs}ms")
+                
+                delay(delayMs)
+                
+                // Check if we still want to reconnect (haven't been manually disconnected)
+                if (_uiState.value.status.startsWith("failure:") || _uiState.value.status.startsWith("closed:")) {
+                    reconnectRetryCount++
+                    Log.i(tag, "Attempting auto-reconnect ($reconnectRetryCount/$MAX_RECONNECT_RETRIES)")
+                    connect(wsUrl, clientId, clientName, fromBoot = false)
+                } else {
+                    // Connection was restored or user disconnected, stop retrying
+                    break
+                }
+            }
+            
+            if (reconnectRetryCount >= MAX_RECONNECT_RETRIES) {
+                Log.w(tag, "Max reconnect attempts reached, giving up")
+            }
+            
+            reconnectJob = null
+        }
     }
 
     fun setPlayoutOffsetMs(ms: Long) {
@@ -439,7 +528,7 @@ class SendspinService : Service() {
                             scope.launch {
                                 // Give network a moment to stabilize
                                 delay(1000)
-                                connect(currentState.wsUrl, currentState.clientId, currentState.clientName)
+                                connect(currentState.wsUrl, currentState.clientId, currentState.clientName, fromBoot = false)
                             }
                         }
                     } else {
@@ -451,6 +540,7 @@ class SendspinService : Service() {
         }
 
         try {
+            @Suppress("DEPRECATION")
             val filter = IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 registerReceiver(connectivityReceiver, filter, Context.RECEIVER_EXPORTED)
@@ -491,7 +581,8 @@ class SendspinService : Service() {
             } else {
                 @Suppress("DEPRECATION")
                 val networkInfo = connectivityManager.activeNetworkInfo
-                networkInfo?.isConnectedOrConnecting == true
+                @Suppress("DEPRECATION")
+                (networkInfo?.isConnectedOrConnecting == true)
             }
         } catch (e: Exception) {
             Log.w(tag, "Error checking network availability", e)
@@ -501,5 +592,43 @@ class SendspinService : Service() {
 
     private fun updateUiState(block: (PlayerViewModel.UiState) -> PlayerViewModel.UiState) {
         _uiState.value = block(_uiState.value)
+    }
+
+    private fun createMemoryTrimCallback(): ComponentCallbacks2 {
+        return object : ComponentCallbacks2 {
+            override fun onTrimMemory(level: Int) {
+                when (level) {
+                    ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> {
+                        Log.e(tag, "CRITICAL memory pressure: clearing audio buffer and pausing playback")
+                        // Critical memory - clear buffers and pause, but keep connection alive
+                        client?.trimAudioBufferCritical()
+                    }
+                    ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE -> {
+                        Log.w(tag, "MODERATE memory pressure: reducing audio buffer")
+                        // Moderate pressure - reduce buffer size
+                        client?.trimAudioBufferModerate()
+                    }
+                    ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> {
+                        Log.w(tag, "LOW memory pressure: trimming audio buffer")
+                        // Low memory - trim but keep playing if possible
+                        client?.trimAudioBufferLow()
+                    }
+                    else -> {
+                        // Other trim levels (background app, etc.) - mostly ignored for foreground service
+                        Log.d(tag, "Memory trim level: $level")
+                    }
+                }
+            }
+
+            override fun onConfigurationChanged(newConfig: Configuration) {
+                // Handle configuration changes if needed
+            }
+
+            override fun onLowMemory() {
+                Log.e(tag, "Critical low memory callback from system!")
+                // This is called when system is in critical state
+                client?.trimAudioBufferCritical()
+            }
+        }
     }
 }
